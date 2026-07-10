@@ -1,0 +1,2866 @@
+---
+title: "WAZ Simulation — Improved (K=1000, Worst-Case & Residual Variance Scenarios)"
+author: "Mthobisi Zondi"
+date: "2026-03-10"
+output: html_document
+---
+
+<!--
+  DESIGN NOTES
+  ============
+  Outcome  : Weight-for-Age Z-score (WAZ)
+  Cohort   : HIV-Uninfected (HUU), N_TARGET = 736
+  Reference country: Malawi (all country fixed effects are
+                     deviations from Malawi's intercept)
+
+  True fixed-effect parameters
+  ─────────────────────────────
+    β₀  Intercept              −0.30
+    β₁  Linear age  (g1)       −0.010
+    β₂  Log age     (g2)        0.20
+    β₃  Inverse age (g3)       −0.08
+    β_SA South Africa vs Malawi  0.55
+    β_UG Uganda vs Malawi        0.15
+    β_ZW Zimbabwe vs Malawi      0.12
+
+  Sample-size scenarios (multiples of real N = 736)
+  ──────────────────────────────────────────────────
+    N =  368  (½ × real — under-recruitment / high dropout)
+    N =  736  (1 × real — Study Anchor)
+    N = 1472  (2 × real — pooled / expanded replication)
+    N = 3680  (5 × real — registry scale)
+
+  Random-effects scenario grid (16 scenarios, 4 groups)
+  ──────────────────────────────────────────────────────
+    Group A: Variance magnitude  (σ₀ and σ₁ scale together)
+    Group B: Slope variability   (σ₁ varies; σ₀ fixed at base)
+    Group C: Intercept–slope ρ   (ρ varies; variances fixed at base)
+    Group D: Worst-case combined (extreme variance + high correlation)
+             NEW: stress-tests LMM under the most challenging conditions
+
+  Residual variance scenarios (Group E) — NEW
+  ─────────────────────────────────────────────
+    σ_ε varies from 0.40 to 1.60 to assess sensitivity to
+    measurement noise (e.g., anthropometry error, secular variation).
+    WAZ baseline residual SD = 0.75 (slightly lower than HAZ = 0.80).
+
+  Reporting metrics — EXPANDED
+  ──────────────────────────────
+    • Bias           : E[β̂] − β_true
+    • RMSE           : √E[(β̂ − β_true)²]
+    • Coverage       : % of 95% CIs containing β_true         ← NEW
+    • Convergence    : % of reps where LMM converged           ← NEW
+    • Type I error   : % false positives when β = 0 (null)    ← NEW
+    • Power          : % of reps correctly rejecting H₀        ← NEW
+                       Reported as a function of N and effect
+                       size (country contrasts and age terms).
+                       Power curve fitted via logistic regression
+                       on the binary reject/not-reject outcome.
+
+  OPTIMISATION NOTES
+  ==================
+  • R_REPS_MAIN  = 1000  (was 200) — full precision for bias/RMSE/coverage
+  • R_REPS_CROSS =  200  (was  50) — crossed grid
+  • Cache directory: sim_cache_WAZ/ — each scenario saved as .rds
+  • To restore fast-run mode: R_REPS_MAIN=200, R_REPS_CROSS=50
+-->
+
+---
+
+# 0. Packages & Global Settings
+
+```{r chunk-0-packages, message=FALSE, warning=FALSE}
+packages <- c(
+  "lme4", "lmerTest", "MASS", "dplyr", "tidyr",
+  "ggplot2", "knitr", "broom.mixed", "pbapply", "purrr", "data.table",
+  "scales", "gridExtra"
+)
+
+installed <- rownames(installed.packages())
+for (pkg in packages) {
+  if (!pkg %in% installed) install.packages(pkg, quiet = TRUE)
+}
+
+library(lme4);      library(lmerTest); library(MASS)
+library(dplyr);     library(tidyr);    library(ggplot2)
+library(knitr);     library(broom.mixed)
+library(pbapply);   library(purrr);    library(data.table)
+library(scales);    library(gridExtra)
+
+set.seed(20260220)
+
+# ── Study anchor ──────────────────────────────────────────────────────────────
+N_TARGET <- 736   # actual number of individuals in the real HUU dataset
+
+# ── Replication counts ────────────────────────────────────────────────────────
+# CHANGED: R_REPS_MAIN raised from 200 → 1000 for stable coverage estimates.
+# Coverage of a 95% CI requires ~1000 reps to estimate with SE < 0.7 pp.
+# Formula: SE(coverage) = sqrt(0.95 * 0.05 / R) → SE < 0.007 when R = 1000.
+R_REPS_MAIN  <- 1000   # ← WAS 200; full precision for bias/RMSE/coverage
+R_REPS_CROSS <-  200   # ← WAS  50; crossed (N × RE) grid
+
+# ── WAZ-specific cache directory (kept separate from HAZ cache) ───────────────
+CACHE_DIR <- "sim_cache_WAZ"
+if (!dir.exists(CACHE_DIR)) dir.create(CACHE_DIR)
+
+cache_save <- function(obj, name) {
+  saveRDS(obj, file.path(CACHE_DIR, paste0(name, ".rds")))
+  invisible(obj)
+}
+cache_load <- function(name) {
+  path <- file.path(CACHE_DIR, paste0(name, ".rds"))
+  if (file.exists(path)) readRDS(path) else NULL
+}
+```
+
+---
+
+# 1. Data-Generating Function
+
+```{r chunk-1-data-gen}
+# ── WAZ data generator ────────────────────────────────────────────────────────
+# Cohort structure, country proportions, maternal and child covariates, and
+# the MAR dropout mechanism are identical to the HAZ simulation.
+# WAZ-specific changes:
+#   • Country-level baseline WAZ means and SDs (lower absolute values than HAZ)
+#   • Fixed-effect coefficients updated to WAZ true parameters (see header)
+#   • Residual SD baseline = 0.75 (WAZ is slightly less variable than HAZ)
+# NEW parameter: sigma_eps (residual SD) — previously hard-coded to 0.75.
+# Exposing it enables Group E (residual variance) scenarios.
+# ─────────────────────────────────────────────────────────────────────────────
+generate_WAZ_data <- function(
+    N         = 500,
+    dropout   = 0.20,
+    sigma_b0  = 0.6,
+    sigma_b1  = 0.02,
+    rho_b01   = 0.2,
+    sigma_eps = 0.75   # ← NEW: residual SD (was hard-coded); WAZ baseline = 0.75
+) {
+
+  # 1. Country assignment (same cohort proportions as HAZ)
+  country <- sample(
+    c("Uganda", "Malawi", "Zimbabwe", "South Africa"),
+    size    = N, replace = TRUE,
+    prob    = c(117, 234, 172, 75) / 598
+  )
+
+  # 2. Maternal age
+  age_mean <- c(Uganda = 31.44, Malawi = 31.57,
+                Zimbabwe = 32.75, "South Africa" = 32.51)
+  age_sd   <- c(Uganda =  5.43, Malawi =  5.13,
+                Zimbabwe =  5.44, "South Africa" =  5.46)
+  maternal_age <- rnorm(N, age_mean[country], age_sd[country])
+
+  # 3. Education
+  edu_levels <- c("no_school", "primary_partial", "primary_complete",
+                  "secondary_partial", "secondary_complete", "college")
+  edu_probs  <- list(
+    Uganda        = c(0.0342, 0.0940, 0.2821, 0.4359, 0.0855, 0.0684),
+    Malawi        = c(0.0855, 0.1410, 0.3333, 0.2991, 0.1154, 0.0256),
+    Zimbabwe      = c(0.0000, 0.0698, 0.0465, 0.3314, 0.5523, 0.0000),
+    "South Africa"= c(0.0000, 0.0133, 0.0400, 0.5067, 0.2933, 0.1467)
+  )
+  edu_cat  <- vapply(country,
+                     function(c) sample(edu_levels, 1, prob = edu_probs[[c]]),
+                     character(1))
+  edu_high <- as.integer(edu_cat %in% c("secondary_complete", "college"))
+
+  # 4. Employment
+  work_levels <- c("not_employed", "self_employed", "formal")
+  work_probs  <- list(
+    Uganda        = c(0.3846, 0.3932, 0.2222),
+    Malawi        = c(0.5556, 0.3248, 0.1197),
+    Zimbabwe      = c(0.4942, 0.4070, 0.0988),
+    "South Africa"= c(0.6800, 0.0400, 0.2800)
+  )
+  work <- vapply(country,
+                 function(c) sample(work_levels, 1, prob = work_probs[[c]]),
+                 character(1))
+
+  # 5. Marital status
+  marital_levels <- c("no_partner", "primary_partner", "married",
+                      "separated", "divorced", "widowed")
+  marital_probs  <- list(
+    Uganda        = c(0.0598, 0.3590, 0.5128, 0.0684, 0.0000, 0.0000),
+    Malawi        = c(0.0085, 0.0128, 0.8333, 0.0214, 0.0470, 0.0769),
+    Zimbabwe      = c(0.0174, 0.0465, 0.8547, 0.0349, 0.0116, 0.0349),
+    "South Africa"= c(0.1333, 0.7333, 0.1200, 0.0133, 0.0000, 0.0000)
+  )
+  marital <- vapply(country,
+                    function(c) sample(marital_levels, 1, prob = marital_probs[[c]]),
+                    character(1))
+
+  # 6. Infrastructure
+  elec_prob <- c(Uganda = 0.7949, Malawi = 0.5385,
+                 Zimbabwe = 0.5930, "South Africa" = 0.9867)
+  tap_prob  <- c(Uganda = 0.3761, Malawi = 0.6154,
+                 Zimbabwe = 0.5698, "South Africa" = 0.9890)
+  electricity <- rbinom(N, 1, elec_prob[country])
+  tapwater    <- rbinom(N, 1,  tap_prob[country])
+
+  # 7. Toilet
+  toilet_levels <- c("none", "other", "pit_latrine",
+                     "private_flush", "shared_flush")
+  toilet_probs  <- list(
+    Uganda        = c(0.0256, 0.0000, 0.8793, 0.0259, 0.0862),
+    Malawi        = c(0.0052, 0.0000, 0.9430, 0.0311, 0.0207),
+    Zimbabwe      = c(0.0116, 0.0291, 0.1977, 0.2267, 0.5349),
+    "South Africa"= c(0.0000, 0.0000, 0.1200, 0.6400, 0.2400)
+  )
+  toilet <- vapply(country,
+                   function(c) sample(toilet_levels, 1, prob = toilet_probs[[c]]),
+                   character(1))
+
+  # 8. Travel time to clinic
+  travel_levels <- c("<30min", "30_60min", ">1hr")
+  travel_probs  <- list(
+    Uganda        = c(0.0342, 0.3675, 0.5983),
+    Malawi        = c(0.0684, 0.5256, 0.4060),
+    Zimbabwe      = c(0.4593, 0.3605, 0.1802),
+    "South Africa"= c(0.3733, 0.4267, 0.2000)
+  )
+  travel <- vapply(country,
+                   function(c) sample(travel_levels, 1, prob = travel_probs[[c]]),
+                   character(1))
+
+  # 9. Child characteristics
+  sex    <- rbinom(N, 1, 0.4769)
+  bw_cat <- sample(c("<2.5", "2.5-4", ">4"), N, replace = TRUE,
+                   prob = c(0.034, 0.911, 0.055))
+  birth_weight <- ifelse(bw_cat == "<2.5",  rnorm(N, 2.3, 0.20),
+                  ifelse(bw_cat == "2.5-4", rnorm(N, 3.2, 0.35),
+                                             rnorm(N, 4.3, 0.25)))
+
+  # 10. Baseline WAZ (country-specific; lower absolute values than HAZ)
+  waz_mean <- c(Uganda = -0.05, Malawi = -0.10,
+                Zimbabwe =  0.20, "South Africa" =  0.05)
+  waz_sd   <- c(Uganda =  1.20, Malawi =  1.25,
+                Zimbabwe =  1.10, "South Africa" =  1.15)
+  waz0 <- rnorm(N, waz_mean[country], waz_sd[country])
+
+  # 11. Random effects
+  Sigma_b <- matrix(c(sigma_b0^2,
+                      rho_b01 * sigma_b0 * sigma_b1,
+                      rho_b01 * sigma_b0 * sigma_b1,
+                      sigma_b1^2), nrow = 2)
+  re  <- mvrnorm(N, mu = c(0, 0), Sigma = Sigma_b)
+  b0  <- re[, 1]
+  b1  <- re[, 2]
+
+  # 12. Longitudinal structure — vectorised, no per-child loop
+  time_pts <- c(0, 6, 12, 18, 24, 36, 48, 60)
+  T        <- length(time_pts)
+
+  idx   <- rep(seq_len(N), each  = T)
+  t_vec <- rep(time_pts,   times = N)
+
+  g1 <- t_vec
+  g2 <- log(t_vec + 1)
+  g3 <- 1 / (t_vec + 1)
+
+  # ── True WAZ fixed effects ────────────────────────────────────────────────
+  #   β₀ Intercept              = −0.30  (Malawi reference)
+  #   β₁ Linear age  (g1)       = −0.010
+  #   β₂ Log age     (g2)       =  0.20
+  #   β₃ Inverse age (g3)       = −0.08
+  #   Country effects vs Malawi:
+  #     South Africa             =  0.55
+  #     Uganda                   =  0.15
+  #     Zimbabwe                 =  0.12
+  # ─────────────────────────────────────────────────────────────────────────
+  country_effect <- ifelse(country[idx] == "South Africa",  0.55,
+                    ifelse(country[idx] == "Uganda",          0.15,
+                    ifelse(country[idx] == "Zimbabwe",        0.12, 0.00)))
+
+  mu <- (-0.30)  +
+        (-0.010) * g1 +
+          0.20   * g2 +
+        (-0.08)  * g3 +
+        country_effect +
+        b0[idx] +
+        b1[idx] * g1
+
+  # CHANGED: uses the sigma_eps argument instead of the hard-coded 0.75
+  Y <- mu + rnorm(N * T, 0, sigma_eps)
+  Y[abs(Y) > 4] <- NA   # WAZ outside ±4 treated as implausible
+
+  df <- data.frame(
+    child_id     = idx,
+    country      = country[idx],
+    maternal_age = maternal_age[idx],
+    education    = edu_cat[idx],
+    edu_high     = edu_high[idx],
+    work         = work[idx],
+    marital      = marital[idx],
+    electricity  = electricity[idx],
+    tapwater     = tapwater[idx],
+    toilet       = toilet[idx],
+    travel       = travel[idx],
+    sex          = sex[idx],
+    birth_weight = birth_weight[idx],
+    age_mo       = t_vec,
+    g1           = g1,
+    g2           = g2,
+    g3           = g3,
+    outcome      = Y,
+    stringsAsFactors = FALSE
+  )
+
+  # 13. MAR dropout
+  ids       <- unique(df$child_id)
+  drop_ids  <- sample(ids, size = round(dropout * N), replace = FALSE)
+  drop_time <- sample(2:T, size = length(drop_ids), replace = TRUE)
+  for (k in seq_along(drop_ids)) {
+    id   <- drop_ids[k]
+    tmin <- time_pts[drop_time[k]]
+    df$outcome[df$child_id == id & df$age_mo >= tmin] <- NA
+  }
+
+  return(df)
+}
+```
+
+---
+
+# 2. Model-Fitting Function
+
+```{r chunk-2-fit-model}
+fit_LMM_WAZ <- function(dat) {
+  # Enforce Malawi as reference country explicitly
+  dat$country <- relevel(factor(dat$country), ref = "Malawi")
+  ctrl        <- lmerControl(optimizer = "bobyqa",
+                              optCtrl  = list(maxfun = 2e5))
+  formula_lmm <- outcome ~ g1 + g2 + g3 + country + (1 + g1 | child_id)
+  fit <- tryCatch(
+    lmer(formula_lmm, data = dat, REML = FALSE, control = ctrl),
+    warning = function(w) {
+      m <- suppressWarnings(
+        lmer(formula_lmm, data = dat, REML = FALSE, control = ctrl)
+      )
+      attr(m, "converge_warning") <- conditionMessage(w)
+      m
+    },
+    error = function(e) NULL
+  )
+  return(fit)
+}
+```
+
+---
+
+# 3. Results-Extraction Function — EXPANDED
+
+```{r chunk-3-extract}
+# CHANGED: now also extracts std.error and p.value so downstream functions
+# can compute empirical coverage, Type I error rate, and power.
+extract_results <- function(model) {
+  if (is.null(model)) return(NULL)
+  converged <- is.null(attr(model, "converge_warning")) && !isSingular(model)
+  broom.mixed::tidy(model, effects = "fixed") %>%
+    dplyr::select(term, estimate, std.error, statistic, p.value) %>%
+    mutate(converged = converged)
+}
+```
+
+---
+
+# 4. Single-Replication Wrapper
+
+```{r chunk-4-single-sim}
+# CHANGED: sigma_eps argument forwarded to generate_WAZ_data().
+single_sim_WAZ <- function(N         = 500,
+                            sigma_b0  = 0.6,
+                            sigma_b1  = 0.02,
+                            rho_b01   = 0.2,
+                            sigma_eps = 0.75) {
+  dat   <- generate_WAZ_data(N         = N,
+                              sigma_b0  = sigma_b0,
+                              sigma_b1  = sigma_b1,
+                              rho_b01   = rho_b01,
+                              sigma_eps = sigma_eps)
+  model <- fit_LMM_WAZ(dat)
+  extract_results(model)
+}
+```
+
+---
+
+# 5. Simulation Runner
+
+```{r chunk-5-run-sim}
+# CHANGED: sigma_eps argument forwarded.
+run_simulation_WAZ <- function(R         = 200,
+                                N         = 500,
+                                sigma_b0  = 0.6,
+                                sigma_b1  = 0.02,
+                                rho_b01   = 0.2,
+                                sigma_eps = 0.75) {
+  res_list <- pblapply(seq_len(R), function(i)
+    single_sim_WAZ(N         = N,
+                   sigma_b0  = sigma_b0,
+                   sigma_b1  = sigma_b1,
+                   rho_b01   = rho_b01,
+                   sigma_eps = sigma_eps)
+  )
+  # data.table::rbindlist is faster than dplyr::bind_rows for large lists
+  rbindlist(res_list, idcol = "rep", fill = TRUE)
+}
+```
+
+---
+
+# 6. True WAZ Parameter Vector
+
+```{r chunk-6-true-values}
+# Reference country: Malawi
+# Country effects are deviations from Malawi's intercept.
+true_values <- c(
+  "(Intercept)"         = -0.30,
+  "g1"                  = -0.010,
+  "g2"                  =  0.20,
+  "g3"                  = -0.08,
+  "countrySouth Africa" =  0.55,
+  "countryUganda"       =  0.15,
+  "countryZimbabwe"     =  0.12
+)
+```
+
+---
+
+# 7. Performance-Summary Helper — EXPANDED
+
+```{r chunk-7-performance}
+# CHANGED: now computes four metrics for each term:
+#   1. Bias             — systematic deviation
+#   2. RMSE             — combined bias + variance
+#   3. Coverage (95%)   — % of 95% CIs that contain β_true
+#   4. Convergence rate — % of reps where the LMM converged
+#
+# NOTE on Type I error:
+#   Type I error is meaningful only when the true effect equals zero.
+#   None of the parameters in `true_values` are zero in the main scenarios.
+#   For the null-scenario check (Section 8c), country effects ARE set to zero
+#   and Type I error is computed directly in that section rather than inside
+#   this helper — keeping the helper general-purpose.
+summarise_performance <- function(sim_results, label = "") {
+
+  # Convergence rate: proportion of ALL reps (not just converged)
+  conv_rate <- sim_results %>%
+    group_by(term) %>%
+    summarise(convergence_rate = mean(converged, na.rm = TRUE), .groups = "drop")
+
+  # Main metrics restricted to converged reps
+  main <- sim_results %>%
+    filter(converged == TRUE) %>%
+    group_by(term) %>%
+    summarise(
+      n_reps        = n(),
+      mean_estimate = mean(estimate,   na.rm = TRUE),
+      bias          = mean(estimate  - true_values[term], na.rm = TRUE),
+      rmse          = sqrt(mean((estimate - true_values[term])^2, na.rm = TRUE)),
+      sd_estimate   = sd(estimate,     na.rm = TRUE),
+      # Coverage: 95% CI = estimate ± 1.96 * SE
+      coverage_95   = mean(
+        abs(estimate - true_values[term]) <= 1.96 * std.error,
+        na.rm = TRUE
+      ),
+      .groups = "drop"
+    ) %>%
+    left_join(conv_rate, by = "term") %>%
+    mutate(scenario = label)
+
+  return(main)
+}
+```
+
+---
+
+# 8. Baseline Simulation *(N = 736 — mirrors the real study)*
+
+## 8a. Run Baseline
+
+```{r chunk-8a-baseline-sim, cache=TRUE}
+# NOTE: R_REPS_MAIN = 1000 — first run will take ~5–10 minutes depending on hardware.
+# All subsequent runs load instantly from cache.
+sim_base_WAZ <- {
+  cached <- cache_load("sim_base_WAZ_k1000")
+  if (!is.null(cached)) {
+    message("Loaded WAZ baseline simulation from cache.")
+    cached
+  } else {
+    message("Running WAZ baseline simulation (N = ", N_TARGET,
+            ", R = ", R_REPS_MAIN, " reps) ...")
+    res <- run_simulation_WAZ(R = R_REPS_MAIN, N = N_TARGET)
+    cache_save(res, "sim_base_WAZ_k1000")
+  }
+}
+
+perf_base_WAZ <- summarise_performance(
+  sim_base_WAZ,
+  label = paste0("WAZ Baseline — Real Study Anchor (N = ", N_TARGET, ")")
+)
+
+knitr::kable(
+  perf_base_WAZ %>%
+    dplyr::select(term, n_reps, mean_estimate, bias, rmse,
+                  coverage_95, convergence_rate, scenario),
+  digits  = 4,
+  caption = paste0(
+    "WAZ baseline performance (N = ", N_TARGET,
+    " — real study size; reference country = Malawi; R = ", R_REPS_MAIN, " reps)"
+  )
+)
+```
+
+## 8b. Coverage Plot *(baseline)*
+
+```{r chunk-8b-coverage-plot, fig.width=9, fig.height=5}
+# Nominal coverage = 0.95; the shaded band shows ±2 × Monte Carlo SE.
+# With R = 1000, MC-SE = sqrt(0.95 * 0.05 / 1000) ≈ 0.007.
+mc_se <- sqrt(0.95 * 0.05 / R_REPS_MAIN)
+
+perf_base_WAZ %>%
+  filter(term %in% names(true_values)) %>%
+  ggplot(aes(x = term, y = coverage_95)) +
+  geom_point(size = 3, colour = "steelblue") +
+  geom_errorbar(aes(ymin = coverage_95 - 2 * mc_se,
+                    ymax = coverage_95 + 2 * mc_se),
+                width = 0.2, colour = "steelblue") +
+  geom_hline(yintercept = 0.95,  linetype = "dashed", colour = "red") +
+  geom_hline(yintercept = 0.95 - 2 * mc_se, linetype = "dotted", colour = "grey50") +
+  geom_hline(yintercept = 0.95 + 2 * mc_se, linetype = "dotted", colour = "grey50") +
+  annotate("rect",
+           xmin = -Inf, xmax = Inf,
+           ymin = 0.95 - 2 * mc_se,
+           ymax = 0.95 + 2 * mc_se,
+           alpha = 0.10, fill = "red") +
+  scale_y_continuous(limits = c(0.85, 1.00),
+                     labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title    = "WAZ: Empirical Coverage of 95% Wald CIs — Baseline (N = 736)",
+    subtitle = paste0("Red dashed = nominal 95%; shaded band = ±2 × MC-SE (",
+                      R_REPS_MAIN, " reps); error bars = ±2 × MC-SE per term"),
+    x        = "Fixed-effect term",
+    y        = "Empirical coverage"
+  ) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+## 8c. Type I Error — Null Country-Effect Scenario
+
+```{r chunk-8c-typeI, cache=TRUE}
+# Type I error is defined only when the true effect = 0.
+# Here we generate data with ALL country effects set to 0 (null scenario)
+# and check how often the LMM incorrectly rejects H₀: β_country = 0.
+# The data-generating model is otherwise identical to baseline (N = 736).
+# We override country_effect inside a local wrapper to ensure β_country = 0.
+
+generate_WAZ_null <- function(N         = 736,
+                               dropout   = 0.20,
+                               sigma_b0  = 0.6,
+                               sigma_b1  = 0.02,
+                               rho_b01   = 0.2,
+                               sigma_eps = 0.75) {
+  df <- generate_WAZ_data(N         = N,
+                           dropout   = dropout,
+                           sigma_b0  = sigma_b0,
+                           sigma_b1  = sigma_b1,
+                           rho_b01   = rho_b01,
+                           sigma_eps = sigma_eps)
+  # Zero out the country contribution from the stored outcome
+  country_effect_orig <- ifelse(df$country == "South Africa",  0.55,
+                          ifelse(df$country == "Uganda",         0.15,
+                          ifelse(df$country == "Zimbabwe",       0.12, 0.00)))
+  df$outcome <- df$outcome - country_effect_orig
+  return(df)
+}
+
+run_typeI_WAZ <- function(R = R_REPS_MAIN) {
+  pblapply(seq_len(R), function(i) {
+    dat   <- generate_WAZ_null(N = N_TARGET)
+    model <- fit_LMM_WAZ(dat)
+    if (is.null(model)) return(NULL)
+    broom.mixed::tidy(model, effects = "fixed") %>%
+      dplyr::select(term, p.value) %>%
+      mutate(converged = is.null(attr(model, "converge_warning")) &&
+                           !isSingular(model))
+  }) %>%
+    rbindlist(idcol = "rep", fill = TRUE)
+}
+
+typeI_results_WAZ <- {
+  cached <- cache_load("WAZ_typeI_k1000")
+  if (!is.null(cached)) { message("Loaded WAZ Type I results from cache."); cached }
+  else {
+    message("Running WAZ Type I error simulation (R = ", R_REPS_MAIN, ") ...")
+    res <- run_typeI_WAZ(R = R_REPS_MAIN)
+    cache_save(res, "WAZ_typeI_k1000")
+  }
+}
+
+typeI_table_WAZ <- typeI_results_WAZ %>%
+  filter(converged, term %in% c("countrySouth Africa",
+                                 "countryUganda", "countryZimbabwe")) %>%
+  group_by(term) %>%
+  summarise(
+    n_reps      = n(),
+    typeI_error = mean(p.value < 0.05, na.rm = TRUE),
+    .groups     = "drop"
+  )
+
+knitr::kable(
+  typeI_table_WAZ,
+  digits  = 4,
+  caption = paste0(
+    "WAZ Type I error rate for country fixed effects under the null (β_country = 0); ",
+    "nominal α = 0.05; R = ", R_REPS_MAIN
+  )
+)
+```
+
+---
+
+# 9. Sample-Size Scenarios
+
+Four scenarios bracket the real study size (N = 736) to quantify how
+estimator performance scales with recruitment scale:
+
+| Scenario | N | Rationale |
+|---|---|---|
+| Half the Real Study | 368 | Under-recruitment or high dropout |
+| **Real Study — Anchor** | **736** | The actual HUU cohort |
+| Double the Real Study | 1 472 | Pooled / expanded replication |
+| Registry Scale — Five Times Real | 3 680 | Large-database ceiling |
+
+> **Runtime note:** N = 3 680 fits take ~3–5× longer than N = 736.
+> Lower `R_REPS_MAIN` or remove 3680 from `sample_size_scenarios`
+> if time is tight.
+
+```{r chunk-9-n-scenarios, cache=TRUE}
+sample_size_scenarios <- list(
+  list(N = round(N_TARGET * 0.5),
+       label = "Half the Real Study (N = 368)"),
+  list(N = N_TARGET,
+       label = "Real Study — Anchor (N = 736)"),
+  list(N = N_TARGET * 2,
+       label = "Double the Real Study (N = 1 472)"),
+  list(N = N_TARGET * 5,
+       label = "Registry Scale — Five Times Real (N = 3 680)")
+)
+
+n_scenario_results_WAZ <- lapply(sample_size_scenarios, function(sc) {
+  cname  <- paste0("WAZ_n_scenario_N", sc$N, "_k1000")
+  cached <- cache_load(cname)
+  if (!is.null(cached)) {
+    message("Loaded WAZ '", sc$label, "' from cache.")
+    return(mutate(cached, N = sc$N, n_label = sc$label))
+  }
+  cat("\n▶ WAZ — Running sample-size scenario:", sc$label, "\n")
+  res <- run_simulation_WAZ(R = R_REPS_MAIN, N = sc$N) %>%
+    mutate(N = sc$N, n_label = sc$label)
+  cache_save(res, cname)
+  res
+})
+
+n_scenario_df_WAZ <- rbindlist(n_scenario_results_WAZ, fill = TRUE) %>%
+  mutate(n_label = factor(
+    n_label,
+    levels = sapply(sample_size_scenarios, `[[`, "label")
+  ))
+
+perf_n_WAZ <- n_scenario_df_WAZ %>%
+  group_by(N, n_label) %>%
+  group_modify(~summarise_performance(.x, label = as.character(.y$n_label))) %>%
+  ungroup()
+
+knitr::kable(
+  perf_n_WAZ %>%
+    dplyr::select(N, n_label, term, n_reps, bias, rmse,
+                  coverage_95, convergence_rate),
+  digits  = 4,
+  caption = paste0(
+    "WAZ performance across sample-size scenarios (anchor = N = ", N_TARGET,
+    "; reference country = Malawi; R = ", R_REPS_MAIN, " reps)"
+  )
+)
+```
+
+---
+
+# 10. Random-Effects Scenarios
+
+## 10a. Define the 16-Scenario Grid *(Groups A–D)*
+
+```{r chunk-10a-re-define}
+# ── Groups A, B, C are unchanged from the original script ────────────────────
+# ── Group D (NEW): Worst-Case Combined scenarios ──────────────────────────────
+#
+#   Rationale for "worst-case" design:
+#   The hardest conditions for an LMM arise when:
+#     (a) Between-child variance is extreme (σ₀ and σ₁ both large), AND
+#     (b) Intercept–slope correlation is strong (|ρ| near 1),
+#   because the random-effects covariance matrix becomes near-singular.
+#   These combined scenarios test whether the LMM remains well-calibrated
+#   (unbiased, nominal coverage) under realistic worst-case assumptions
+#   drawn from the observed WAZ literature.
+#
+#   Three sub-scenarios:
+#     D1. Extreme variance + strong negative correlation
+#         (children with high WAZ at birth lose weight-gain advantage)
+#     D2. Extreme variance + strong positive correlation
+#         (children with high WAZ at birth maintain/widen advantage)
+#     D3. Near-maximal stress: σ₀ = 2.0, σ₁ = 0.12, ρ = −0.90
+#         (pathological but informative boundary case)
+# ─────────────────────────────────────────────────────────────────────────────
+re_scenarios <- list(
+
+  # ── Group A: Variance Magnitude ───────────────────────────────────────────
+  "Minimal Between-Child Variation" = list(
+    sigma_b0 = 0.20, sigma_b1 = 0.005, rho_b01 =  0.0,
+    group    = "A: Variance Magnitude",
+    label    = "Minimal Between-Child Variation\n(σ₀=0.20, σ₁=0.005)"
+  ),
+  "Low Between-Child Variation" = list(
+    sigma_b0 = 0.40, sigma_b1 = 0.010, rho_b01 =  0.0,
+    group    = "A: Variance Magnitude",
+    label    = "Low Between-Child Variation\n(σ₀=0.40, σ₁=0.010)"
+  ),
+  "Baseline Variation — Study Anchor \u2605" = list(
+    sigma_b0 = 0.60, sigma_b1 = 0.020, rho_b01 =  0.2,
+    group    = "A: Variance Magnitude",
+    label    = "Baseline Variation — Study Anchor \u2605\n(σ₀=0.60, σ₁=0.020)"
+  ),
+  "High Between-Child Variation" = list(
+    sigma_b0 = 1.00, sigma_b1 = 0.050, rho_b01 =  0.2,
+    group    = "A: Variance Magnitude",
+    label    = "High Between-Child Variation\n(σ₀=1.00, σ₁=0.050)"
+  ),
+  "Extreme Between-Child Variation" = list(
+    sigma_b0 = 1.50, sigma_b1 = 0.080, rho_b01 =  0.2,
+    group    = "A: Variance Magnitude",
+    label    = "Extreme Between-Child Variation\n(σ₀=1.50, σ₁=0.080)"
+  ),
+
+  # ── Group B: Slope Variability ────────────────────────────────────────────
+  "Near-Identical Growth Trajectories" = list(
+    sigma_b0 = 0.60, sigma_b1 = 0.005, rho_b01 =  0.2,
+    group    = "B: Slope Variability",
+    label    = "Near-Identical Growth Trajectories\n(σ₁=0.005)"
+  ),
+  "Moderately Diverging Growth Trajectories" = list(
+    sigma_b0 = 0.60, sigma_b1 = 0.040, rho_b01 =  0.2,
+    group    = "B: Slope Variability",
+    label    = "Moderately Diverging Growth Trajectories\n(σ₁=0.040)"
+  ),
+  "Highly Diverging Growth Trajectories" = list(
+    sigma_b0 = 0.60, sigma_b1 = 0.100, rho_b01 =  0.2,
+    group    = "B: Slope Variability",
+    label    = "Highly Diverging Growth Trajectories\n(σ₁=0.100)"
+  ),
+
+  # ── Group C: Intercept–Slope Correlation ──────────────────────────────────
+  "Strong Negative Intercept-Slope Correlation" = list(
+    sigma_b0 = 0.60, sigma_b1 = 0.020, rho_b01 = -0.7,
+    group    = "C: Intercept-Slope Correlation",
+    label    = "Strong Negative Intercept-Slope Correlation\n(rho=-0.70)"
+  ),
+  "Moderate Negative Intercept-Slope Correlation" = list(
+    sigma_b0 = 0.60, sigma_b1 = 0.020, rho_b01 = -0.4,
+    group    = "C: Intercept-Slope Correlation",
+    label    = "Moderate Negative Intercept-Slope Correlation\n(rho=-0.40)"
+  ),
+  "No Intercept-Slope Correlation" = list(
+    sigma_b0 = 0.60, sigma_b1 = 0.020, rho_b01 =  0.0,
+    group    = "C: Intercept-Slope Correlation",
+    label    = "No Intercept-Slope Correlation\n(rho=0.00)"
+  ),
+  "Moderate Positive Intercept-Slope Correlation" = list(
+    sigma_b0 = 0.60, sigma_b1 = 0.020, rho_b01 =  0.4,
+    group    = "C: Intercept-Slope Correlation",
+    label    = "Moderate Positive Intercept-Slope Correlation\n(rho=+0.40)"
+  ),
+  "Strong Positive Intercept-Slope Correlation" = list(
+    sigma_b0 = 0.60, sigma_b1 = 0.020, rho_b01 =  0.7,
+    group    = "C: Intercept-Slope Correlation",
+    label    = "Strong Positive Intercept-Slope Correlation\n(rho=+0.70)"
+  ),
+
+  # ── Group D: Worst-Case Combined (NEW) ────────────────────────────────────
+  # Combines extreme variance (Group A ceiling) with strong correlation
+  # (Group C extremes) to create the most challenging scenario for the LMM.
+  # Expected outcomes: reduced convergence, inflated SE, possible coverage drop.
+  "Worst-Case: Extreme Variance + Strong Negative Correlation" = list(
+    sigma_b0 = 1.50, sigma_b1 = 0.080, rho_b01 = -0.70,
+    group    = "D: Worst-Case Combined",
+    label    = "Worst-Case: Extreme Var + Strong Neg Corr\n(σ₀=1.50, σ₁=0.080, rho=-0.70)"
+  ),
+  "Worst-Case: Extreme Variance + Strong Positive Correlation" = list(
+    sigma_b0 = 1.50, sigma_b1 = 0.080, rho_b01 =  0.70,
+    group    = "D: Worst-Case Combined",
+    label    = "Worst-Case: Extreme Var + Strong Pos Corr\n(σ₀=1.50, σ₁=0.080, rho=+0.70)"
+  ),
+  "Worst-Case: Near-Maximal Stress" = list(
+    sigma_b0 = 2.00, sigma_b1 = 0.120, rho_b01 = -0.90,
+    group    = "D: Worst-Case Combined",
+    label    = "Worst-Case: Near-Maximal Stress\n(σ₀=2.00, σ₁=0.120, rho=-0.90)"
+  )
+)
+
+# Parameter look-up table
+re_param_table <- imap_dfr(re_scenarios, function(sc, nm) {
+  data.frame(
+    scenario_name = nm,
+    group         = sc$group,
+    sigma_b0      = sc$sigma_b0,
+    sigma_b1      = sc$sigma_b1,
+    rho_b01       = sc$rho_b01,
+    var_b0        = sc$sigma_b0^2,
+    var_b1        = sc$sigma_b1^2,
+    cov_b01       = sc$rho_b01 * sc$sigma_b0 * sc$sigma_b1
+  )
+})
+
+knitr::kable(re_param_table, digits = 4,
+             caption = "WAZ random-effects scenario parameter grid (star = Study Anchor)")
+```
+
+## 10b. Run RE Scenarios
+
+```{r chunk-10b-re-scenarios-run, cache=TRUE}
+re_results_WAZ <- imap(re_scenarios, function(sc, name) {
+  safe_name <- gsub("[^A-Za-z0-9]", "_", name)
+  cname     <- paste0("WAZ_re_scenario_", safe_name, "_k1000")
+  cached    <- cache_load(cname)
+  if (!is.null(cached)) {
+    message("Loaded WAZ RE scenario '", name, "' from cache.")
+    return(mutate(cached, re_scenario = sc$label, re_group = sc$group))
+  }
+  cat("\n▶ WAZ — Running RE scenario:", name, "\n")
+  res <- run_simulation_WAZ(
+    R        = R_REPS_MAIN,
+    N        = N_TARGET,
+    sigma_b0 = sc$sigma_b0,
+    sigma_b1 = sc$sigma_b1,
+    rho_b01  = sc$rho_b01
+  ) %>%
+    mutate(re_scenario = sc$label, re_group = sc$group)
+  cache_save(res, cname)
+  res
+})
+
+re_results_df_WAZ <- rbindlist(re_results_WAZ, fill = TRUE)
+```
+
+## 10c. RE Performance Table
+
+```{r chunk-10c-re-performance}
+key_terms <- c(
+  "(Intercept)", "g1", "g2", "g3",
+  "countrySouth Africa", "countryUganda", "countryZimbabwe"
+)
+
+perf_re_WAZ <- re_results_df_WAZ %>%
+  group_by(re_group, re_scenario) %>%
+  group_modify(~summarise_performance(.x, label = .y$re_scenario)) %>%
+  ungroup()
+
+knitr::kable(
+  perf_re_WAZ %>%
+    dplyr::select(re_group, re_scenario, term, n_reps,
+                  bias, rmse, coverage_95, convergence_rate),
+  digits  = 4,
+  caption = paste0(
+    "WAZ fixed-effect performance across RE scenarios — Groups A–D ",
+    "(N = ", N_TARGET, "; R = ", R_REPS_MAIN, " reps; reference country = Malawi)"
+  )
+)
+```
+
+---
+
+# 11. Residual Variance Scenarios *(Group E — NEW)*
+
+```{r chunk-11-resid-var, cache=TRUE}
+# ── Design rationale ──────────────────────────────────────────────────────────
+# σ_ε captures within-child measurement noise (anthropometry error, day-to-day
+# biological variation, data entry error).  The default σ_ε = 0.75 reflects
+# typical WAZ reproducibility.  Scenarios range from "near-perfect measurement"
+# (σ_ε = 0.40 — akin to calibrated digital scales with repeat measures) to
+# "high noise" (σ_ε = 1.60 — field conditions with single-observer WAZ).
+#
+# A key question: does inflated residual variance primarily inflate SE (and
+# thus widen CIs, maintaining coverage) or does it also bias fixed effects?
+# Under a correctly specified LMM the answer should be "SE only" — deviations
+# from nominal coverage signal mis-specification or small-sample issues.
+# ─────────────────────────────────────────────────────────────────────────────
+resid_scenarios <- list(
+  list(sigma_eps = 0.40, label = "Low Residual Noise (σ_ε = 0.40)"),
+  list(sigma_eps = 0.60, label = "Moderate-Low Residual Noise (σ_ε = 0.60)"),
+  list(sigma_eps = 0.75, label = "Baseline Residual Noise ★ (σ_ε = 0.75)"),
+  list(sigma_eps = 1.00, label = "Moderate-High Residual Noise (σ_ε = 1.00)"),
+  list(sigma_eps = 1.20, label = "High Residual Noise (σ_ε = 1.20)"),
+  list(sigma_eps = 1.60, label = "Very High Residual Noise (σ_ε = 1.60)")
+)
+
+resid_results_WAZ <- lapply(resid_scenarios, function(sc) {
+  safe  <- gsub("[^A-Za-z0-9]", "_", sc$label)
+  cname <- paste0("WAZ_resid_", safe, "_k1000")
+  cached <- cache_load(cname)
+  if (!is.null(cached)) {
+    message("Loaded WAZ residual-variance scenario '", sc$label, "' from cache.")
+    return(mutate(cached, eps_label = sc$label, sigma_eps = sc$sigma_eps))
+  }
+  cat("\n▶ WAZ — Residual variance scenario:", sc$label, "\n")
+  res <- run_simulation_WAZ(
+    R         = R_REPS_MAIN,
+    N         = N_TARGET,
+    sigma_eps = sc$sigma_eps
+  ) %>%
+    mutate(eps_label = sc$label, sigma_eps = sc$sigma_eps)
+  cache_save(res, cname)
+  res
+})
+
+resid_df_WAZ <- rbindlist(resid_results_WAZ, fill = TRUE) %>%
+  mutate(eps_label = factor(eps_label,
+                             levels = sapply(resid_scenarios, `[[`, "label")))
+
+perf_resid_WAZ <- resid_df_WAZ %>%
+  group_by(sigma_eps, eps_label) %>%
+  group_modify(~summarise_performance(.x, label = as.character(.y$eps_label))) %>%
+  ungroup()
+
+knitr::kable(
+  perf_resid_WAZ %>%
+    dplyr::select(sigma_eps, eps_label, term, n_reps,
+                  bias, rmse, coverage_95, convergence_rate),
+  digits  = 4,
+  caption = paste0(
+    "WAZ performance across residual-variance scenarios (Group E) — ",
+    "N = ", N_TARGET, "; R = ", R_REPS_MAIN, " reps; reference = Malawi"
+  )
+)
+```
+
+---
+
+# 12. Crossed Scenarios *(N × RE)*
+
+> R = `R_REPS_CROSS` (default 200) keeps this feasible.
+> Registry scale (N = 3 680) is excluded; results at that N are
+> reported in Section 9.
+
+```{r chunk-12-crossed, cache=TRUE}
+# ── Crossed design: Sample Size × Random-Effects Structure ───────────────────
+# 3 sample sizes × 16 RE scenarios = 48 simulation cells
+# ─────────────────────────────────────────────────────────────────────────────
+crossed_n_values <- c(
+  round(N_TARGET * 0.5),   # Half the Real Study  (N = 368)
+  N_TARGET,                # Real Study — Anchor  (N = 736)
+  N_TARGET * 2             # Double the Real Study (N = 1 472)
+)
+
+crossed_n_labels <- c(
+  paste0("Half the Real Study (N = ",    round(N_TARGET * 0.5), ")"),
+  paste0("Real Study — Anchor (N = ",    N_TARGET, ")"),
+  paste0("Double the Real Study (N = ",  N_TARGET * 2, ")")
+)
+names(crossed_n_labels) <- as.character(crossed_n_values)
+
+crossed_grid <- expand.grid(
+  N       = crossed_n_values,
+  re_name = names(re_scenarios),
+  stringsAsFactors = FALSE
+)
+
+crossed_results_WAZ <- pmap_dfr(crossed_grid, function(N, re_name) {
+  sc        <- re_scenarios[[re_name]]
+  safe_name <- gsub("[^A-Za-z0-9]", "_", re_name)
+  cname     <- paste0("WAZ_crossed_N", N, "_", safe_name, "_k200")
+  cached    <- cache_load(cname)
+  if (!is.null(cached)) {
+    message("Loaded WAZ crossed cell: '",
+            crossed_n_labels[as.character(N)], "' x '", re_name, "'")
+    return(mutate(cached,
+                  N           = N,
+                  n_label     = crossed_n_labels[as.character(N)],
+                  re_scenario = sc$label,
+                  re_group    = sc$group))
+  }
+  cat("\n▶ WAZ crossed:", crossed_n_labels[as.character(N)], "x", re_name, "\n")
+  res <- run_simulation_WAZ(
+    R        = R_REPS_CROSS,
+    N        = N,
+    sigma_b0 = sc$sigma_b0,
+    sigma_b1 = sc$sigma_b1,
+    rho_b01  = sc$rho_b01
+  ) %>%
+    mutate(N           = N,
+           n_label     = crossed_n_labels[as.character(N)],
+           re_scenario = sc$label,
+           re_group    = sc$group)
+  cache_save(res, cname)
+  res
+})
+
+perf_crossed_WAZ <- crossed_results_WAZ %>%
+  group_by(N, n_label, re_group, re_scenario) %>%
+  group_modify(~summarise_performance(
+    .x,
+    label = paste0(.y$n_label, " | ", .y$re_scenario)
+  )) %>%
+  ungroup()
+
+knitr::kable(
+  perf_crossed_WAZ %>%
+    dplyr::select(N, n_label, re_group, re_scenario, term,
+                  bias, rmse, coverage_95, convergence_rate),
+  digits  = 4,
+  caption = "WAZ crossed (N × RE) performance table (reference country = Malawi)"
+)
+```
+
+---
+
+# 13. Visualisation
+
+## 13a. Bias by RE Scenario *(Groups A–D, faceted)*
+
+```{r chunk-13a-bias-plot, fig.width = 13, fig.height = 9}
+perf_re_WAZ %>%
+  filter(term %in% key_terms) %>%
+  mutate(re_scenario = gsub("\n", " ", re_scenario)) %>%
+  ggplot(aes(x = re_scenario, y = bias, fill = re_group)) +
+  geom_col(show.legend = FALSE) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  facet_grid(term ~ re_group, scales = "free") +
+  labs(
+    title    = "WAZ: Bias of Fixed-Effect Estimates Across RE Scenarios (Groups A–D)",
+    subtitle = paste0("N = ", N_TARGET, "; R = ", R_REPS_MAIN,
+                      " reps; dashed = zero bias; Group D = worst-case combined"),
+    x        = "Random-Effects Scenario",
+    y        = "Bias (estimated − true)"
+  ) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 7))
+```
+
+## 13b. Coverage by RE Scenario
+
+```{r chunk-13b-coverage-re, fig.width = 13, fig.height = 7}
+mc_se <- sqrt(0.95 * 0.05 / R_REPS_MAIN)
+
+perf_re_WAZ %>%
+  filter(term %in% key_terms) %>%
+  mutate(re_scenario = gsub("\n", " ", re_scenario),
+         worst_case  = grepl("Worst-Case", re_scenario)) %>%
+  ggplot(aes(x = re_scenario, y = coverage_95,
+             colour = re_group, shape = worst_case)) +
+  geom_point(size = 2.5) +
+  geom_errorbar(aes(ymin = coverage_95 - 2 * mc_se,
+                    ymax = coverage_95 + 2 * mc_se),
+                width = 0.3) +
+  geom_hline(yintercept = 0.95, linetype = "dashed", colour = "red") +
+  annotate("rect",
+           xmin = -Inf, xmax = Inf,
+           ymin = 0.95 - 2 * mc_se,
+           ymax = 0.95 + 2 * mc_se,
+           alpha = 0.08, fill = "red") +
+  facet_wrap(~term, scales = "free_x", ncol = 2) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     limits = c(0.80, 1.00)) +
+  scale_shape_manual(values = c(`FALSE` = 16, `TRUE` = 17),
+                     labels = c("Standard", "Worst-Case (Group D)")) +
+  labs(
+    title    = "WAZ: Empirical Coverage of 95% CIs Across RE Scenarios",
+    subtitle = paste0("Triangles = worst-case (Group D); red band = ±2 × MC-SE (",
+                      R_REPS_MAIN, " reps)"),
+    x        = "RE Scenario",
+    y        = "Empirical Coverage",
+    colour   = "RE Group",
+    shape    = "Scenario type"
+  ) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 50, hjust = 1, size = 6),
+        legend.position = "bottom")
+```
+
+## 13c. RMSE by Sample Size
+
+```{r chunk-13c-rmse-n, fig.width = 11, fig.height = 6}
+n_label_order <- sapply(sample_size_scenarios, `[[`, "label")
+
+perf_n_WAZ %>%
+  filter(term %in% key_terms) %>%
+  mutate(n_label = factor(n_label, levels = n_label_order)) %>%
+  ggplot(aes(x = n_label, y = rmse, group = term, colour = term)) +
+  geom_line() +
+  geom_point(size = 2) +
+  geom_vline(
+    xintercept = which(n_label_order == paste0("Real Study — Anchor (N = ", N_TARGET, ")")),
+    linetype = "dashed", colour = "grey40"
+  ) +
+  labs(
+    title    = "WAZ: RMSE by Sample-Size Scenario",
+    subtitle = paste0("Dashed = real study anchor (N = ", N_TARGET,
+                      "); R = ", R_REPS_MAIN, " reps"),
+    x        = "Sample-Size Scenario",
+    y        = "RMSE",
+    colour   = "Fixed-Effect Term"
+  ) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1, size = 9))
+```
+
+## 13d. Coverage by Sample Size
+
+```{r chunk-13d-coverage-n, fig.width = 11, fig.height = 6}
+
+mc_se <- sqrt(0.95 * 0.05 / R_REPS_MAIN)
+
+perf_n_WAZ %>%
+  filter(term %in% key_terms) %>%
+  mutate(n_label = factor(n_label, levels = n_label_order)) %>%
+  ggplot(aes(x = n_label, y = coverage_95, group = term, colour = term)) +
+  geom_line() +
+  geom_point(size = 2) +
+  geom_hline(yintercept = 0.95, linetype = "dashed", colour = "red") +
+  annotate("rect",
+           xmin = -Inf, xmax = Inf,
+           ymin = 0.95 - 2 * mc_se,
+           ymax = 0.95 + 2 * mc_se,
+           alpha = 0.08, fill = "red") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     limits = c(0.85, 1.00)) +
+  labs(
+    title    = "WAZ: 95% CI Coverage by Sample-Size Scenario",
+    subtitle = "Red dashed = nominal 95%; shaded band = ±2 × MC-SE",
+    x        = "Sample-Size Scenario",
+    y        = "Empirical Coverage",
+    colour   = "Fixed-Effect Term"
+  ) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1, size = 9))
+```
+
+## 13e. Residual Variance — RMSE & Coverage
+
+```{r chunk-13e-resid-plots, fig.width = 12, fig.height = 10}
+png("Residual Variance.png", width = 800, height = 600)
+p_rmse_eps <- perf_resid_WAZ %>%
+  filter(term %in% key_terms) %>%
+  ggplot(aes(x = sigma_eps, y = rmse, colour = term)) +
+  geom_line() + geom_point(size = 2) +
+  geom_vline(xintercept = 0.75, linetype = "dashed", colour = "grey40") +
+  annotate("text", x = 0.75, y = Inf,
+           label = "Baseline\n(σ_ε=0.75)", vjust = 1.5, hjust = -0.1,
+           size = 3, colour = "grey40") +
+  labs(title = "RMSE vs Residual Noise Level",
+       x = "Residual SD (σ_ε)", y = "RMSE", colour = "Term") +
+  theme_bw()
+
+mc_se <- sqrt(0.95 * 0.05 / R_REPS_MAIN)
+
+p_cov_eps <- perf_resid_WAZ %>%
+  filter(term %in% key_terms) %>%
+  ggplot(aes(x = sigma_eps, y = coverage_95, colour = term)) +
+  geom_line() + geom_point(size = 2) +
+  geom_hline(yintercept = 0.95, linetype = "dashed", colour = "red") +
+  annotate("rect",
+           xmin = -Inf, xmax = Inf,
+           ymin = 0.95 - 2 * mc_se,
+           ymax = 0.95 + 2 * mc_se,
+           alpha = 0.08, fill = "red") +
+  geom_vline(xintercept = 0.75, linetype = "dashed", colour = "grey40") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     limits = c(0.85, 1.00)) +
+  labs(title = "95% CI Coverage vs Residual Noise Level",
+       x = "Residual SD (σ_ε)", y = "Empirical Coverage", colour = "Term") +
+  theme_bw()
+
+gridExtra::grid.arrange(p_rmse_eps, p_cov_eps, nrow = 2,
+  top = grid::textGrob(
+    paste0("WAZ: Impact of Residual Variance on RMSE and Coverage\n",
+           "(Group E scenarios; N = ", N_TARGET,
+           "; R = ", R_REPS_MAIN, " reps; reference = Malawi)"),
+    gp = grid::gpar(fontsize = 13, fontface = "bold")
+  )
+)
+dev.off()
+```
+
+## 13f. Empirical Distribution of Estimates *(baseline)*
+
+```{r chunk-13f-density-plot, fig.width = 11, fig.height = 7}
+truth_df <- data.frame(
+  term  = names(true_values),
+  truth = true_values
+) %>% filter(term %in% key_terms)
+
+sim_base_WAZ %>%
+  filter(converged == TRUE, term %in% key_terms) %>%
+  ggplot(aes(x = estimate)) +
+  geom_density(fill = "steelblue", alpha = 0.45) +
+  geom_vline(data = truth_df, aes(xintercept = truth),
+             colour = "red", linetype = "dashed") +
+  facet_wrap(~term, scales = "free") +
+  labs(
+    title    = "WAZ: Empirical Sampling Distribution of Fixed-Effect Estimates",
+    subtitle = paste0("Baseline: N = ", N_TARGET, ", R = ", R_REPS_MAIN,
+                      " reps; red dashed = true value"),
+    x = "Estimate", y = "Density"
+  ) +
+  theme_bw()
+```
+
+## 13g. Bias Heat-Map *(crossed N × RE grid)*
+
+```{r chunk-13g-bias-heatmap, fig.width = 12, fig.height = 16}
+heatmap_term <- "g2"
+
+perf_crossed_WAZ %>%
+  filter(term == heatmap_term) %>%
+  mutate(
+    re_scenario = gsub("\n", " ", re_scenario),
+    n_label     = factor(n_label,
+                         levels = sapply(sample_size_scenarios[1:3], `[[`, "label"))
+  ) %>%
+  ggplot(aes(x = n_label, y = re_scenario, fill = bias)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = round(bias, 3)), size = 3) +
+  scale_fill_gradient2(low = "steelblue", mid = "white",
+                       high = "firebrick", midpoint = 0) +
+  facet_wrap(~re_group, scales = "free_y", ncol = 1) +
+  labs(
+    title    = "WAZ Bias Heat-Map: Sample Size × RE Scenarios (Groups A–D)",
+    subtitle = paste0("Term: ", heatmap_term,
+                      "; Group D = worst-case combined; reference = Malawi"),
+    x = "Sample-Size Scenario", y = "RE Scenario", fill = "Bias"
+  ) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1, size = 8),
+        axis.text.y = element_text(size = 8))
+```
+
+## 13h. Coverage Heat-Map *(crossed N × RE grid — NEW)*
+
+```{r chunk-13h-coverage-heatmap, fig.width = 12, fig.height = 16}
+perf_crossed_WAZ %>%
+  filter(term == heatmap_term) %>%
+  mutate(
+    re_scenario = gsub("\n", " ", re_scenario),
+    n_label     = factor(n_label,
+                         levels = sapply(sample_size_scenarios[1:3], `[[`, "label"))
+  ) %>%
+  ggplot(aes(x = n_label, y = re_scenario, fill = coverage_95)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = scales::percent(coverage_95, accuracy = 1)), size = 3) +
+  scale_fill_gradient2(low = "firebrick", mid = "white",
+                       high = "steelblue", midpoint = 0.95,
+                       limits = c(0.80, 1.00),
+                       labels = scales::percent_format()) +
+  facet_wrap(~re_group, scales = "free_y", ncol = 1) +
+  labs(
+    title    = "WAZ Coverage Heat-Map: Sample Size × RE Scenarios (Groups A–D)",
+    subtitle = paste0("Term: ", heatmap_term,
+                      "; nominal 95%; blue = adequate; red = under-coverage; ",
+                      "reference = Malawi"),
+    x = "Sample-Size Scenario", y = "RE Scenario", fill = "Coverage"
+  ) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1, size = 8),
+        axis.text.y = element_text(size = 8))
+```
+
+## 13i. Observed WAZ Trajectories by Country
+
+```{r chunk-13i-waz-scatter, fig.width = 12, fig.height = 7}
+# Run once using the baseline simulation to generate a representative dataset
+png("WAZ trajectories.png", width = 800, height = 600)
+set.seed(20260220)
+plot_data_WAZ <- generate_WAZ_data(N = N_TARGET, dropout = 0.20) %>%
+  filter(!is.na(outcome))
+
+ggplot(plot_data_WAZ, aes(x = age_mo, y = outcome, color = country)) +
+  geom_point(alpha = 0.3, size = 0.8) +
+  geom_smooth(method = "loess", se = TRUE, linewidth = 1, alpha = 0.2) +
+  geom_hline(yintercept =  0, linetype = "dashed", color = "red",   linewidth = 1) +
+  geom_hline(yintercept = -2, linetype = "dashed", color = "red",   linewidth = 1) +
+  geom_vline(xintercept = seq(6, 60, 6), linetype = "dashed",
+             color = "black", linewidth = 0.4) +
+  annotate("text", x = 59, y =  0, label = "WHO expected WAZ",
+           color = "black", hjust = 1.1, fontface = "italic", size = 4) +
+  annotate("text", x = 59, y = -2, label = "Wasting",
+           color = "black", hjust = 1.1, fontface = "italic", size = 4) +
+  scale_color_manual(values = c("Uganda"       = "blue",
+                                 "Malawi"       = "red",
+                                 "Zimbabwe"     = "black",
+                                 "South Africa" = "orange")) +
+  scale_x_continuous(breaks = seq(6, 60, 6)) +
+  coord_cartesian(ylim = c(-2.5, 2.5)) +
+  labs(x = "Age (months)", y = "Weight-for-age z-score (WAZ)", color = "Country") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom",
+        panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8))
+dev.off()
+```
+
+---
+
+# 14. Power Analysis
+
+```{r chunk-14-power-design}
+# ── Design rationale ──────────────────────────────────────────────────────────
+# Power = P(reject H₀ | H₁ true) = proportion of converged reps in which
+# the two-sided Wald test at α = 0.05 correctly rejects the null.
+#
+# In this simulation every replication uses the TRUE parameter values as the
+# data-generating mechanism, so EVERY rejection is a true positive.
+# Power is therefore estimated directly as:
+#
+#   power(term, scenario) = mean(p.value < 0.05 | converged)
+#
+# Three complementary views are provided:
+#
+#   14a. Power table — by term × sample-size scenario
+#        Answers: at the real study N = 736, which terms are reliably detected?
+#
+#   14b. Power curves — empirical (points) + logistic-regression fit (line)
+#        as a function of N for each fixed-effect term.
+#        The logistic fit uses the binary reject/not-reject outcome ~ log(N),
+#        giving a smooth power curve and an estimated N for 80% power.
+#
+#   14c. N-for-80%-power summary table
+#        Answers: how close is the real study to adequately-powered status
+#        for each WAZ term?
+#
+#   14d. Power heat-map — term × RE scenario
+#        Answers: which random-effects structures degrade power most?
+#        Particularly informative for Group D (worst-case) scenarios.
+#
+#   14e. Power vs residual noise (Group E)
+#        Answers: how much does measurement error erode detection of WAZ
+#        effects — especially the smaller country contrasts (Uganda = 0.15,
+#        Zimbabwe = 0.12)?
+#
+# NOTE: α = 0.05 throughout (two-sided Wald test via lmerTest z-statistics).
+# For a Bonferroni-corrected threshold (7 terms), replace 0.05 with 0.05/7.
+# ─────────────────────────────────────────────────────────────────────────────
+ALPHA <- 0.05
+```
+
+## 14a. Power Table by Sample Size
+
+```{r chunk-14a-power-table}
+power_n_WAZ <- n_scenario_df_WAZ %>%
+  filter(converged == TRUE, term %in% key_terms) %>%
+  group_by(N, n_label, term) %>%
+  summarise(
+    n_reps        = n(),
+    power         = mean(p.value < ALPHA, na.rm = TRUE),
+    power_se      = sqrt(power * (1 - power) / n_reps),
+    .groups       = "drop"
+  ) %>%
+  mutate(n_label = factor(n_label,
+                           levels = sapply(sample_size_scenarios, `[[`, "label")))
+
+knitr::kable(
+  power_n_WAZ %>%
+    dplyr::select(n_label, term, n_reps, power, power_se) %>%
+    arrange(n_label, term),
+  digits  = 3,
+  caption = paste0(
+    "WAZ empirical power (α = ", ALPHA, ") by fixed-effect term and sample-size scenario ",
+    "(R = ", R_REPS_MAIN, " reps per cell; power_se = binomial SE)"
+  )
+)
+```
+
+## 14b. Power Curves with Logistic-Regression Fit
+
+```{r chunk-14b-power-curves, fig.width = 12, fig.height = 7}
+# ── Fit logistic power curve per term ────────────────────────────────────────
+# Model: logit(reject) ~ log(N), fit on the raw rep-level data.
+# Predicted curve is evaluated on a fine N grid for a smooth visual.
+# The N at which predicted power = 0.80 is extracted and annotated.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Rep-level binary outcome for logistic regression
+power_raw_WAZ <- n_scenario_df_WAZ %>%
+  filter(converged == TRUE, term %in% key_terms) %>%
+  mutate(rejected = as.integer(p.value < ALPHA))
+
+# Grid of N values for prediction
+n_grid <- data.frame(N = seq(100, N_TARGET * 5, by = 10))
+
+# Fit + predict per term
+power_curves_WAZ <- power_raw_WAZ %>%
+  group_by(term) %>%
+  group_modify(function(df, key) {
+    fit <- glm(rejected ~ log(N), data = df, family = binomial)
+    pred <- predict(fit, newdata = n_grid, type = "response")
+
+    # Estimated N for 80% power via uniroot (safe fallback if outside range)
+    n80 <- tryCatch({
+      uniroot(function(n) predict(fit,
+                                   newdata = data.frame(N = n),
+                                   type    = "response") - 0.80,
+              interval = c(50, N_TARGET * 10))$root
+    }, error = function(e) NA_real_)
+
+    cbind(n_grid, power_pred = pred, n80 = n80)
+  }) %>%
+  ungroup()
+
+# Empirical points (exclude registry scale for clarity)
+power_emp_WAZ <- power_n_WAZ %>%
+  filter(!grepl("Registry", n_label))
+
+ggplot() +
+  geom_line(data  = power_curves_WAZ,
+            aes(x = N, y = power_pred, colour = term),
+            linewidth = 0.9) +
+  geom_hline(yintercept = 0.80, linetype = "dashed", colour = "grey40") +
+  geom_point(data  = power_emp_WAZ,
+             aes(x = N, y = power, colour = term),
+             size = 3, shape = 16) +
+  geom_errorbar(data  = power_emp_WAZ,
+                aes(x = N,
+                    ymin = pmax(0, power - 1.96 * power_se),
+                    ymax = pmin(1, power + 1.96 * power_se),
+                    colour = term),
+                width = 30) +
+  geom_segment(
+    data = power_curves_WAZ %>%
+      dplyr::select(term, n80) %>%
+      distinct() %>%
+      filter(!is.na(n80)),
+    aes(x = n80, xend = n80, y = 0, yend = 0.80, colour = term),
+    linetype = "dotted", linewidth = 0.6
+  ) +
+  geom_vline(xintercept = N_TARGET, linetype = "longdash",
+             colour = "black", linewidth = 0.6) +
+  annotate("text", x = N_TARGET, y = 0.05,
+           label = paste0("Real study\nN = ", N_TARGET),
+           hjust = -0.08, size = 3, colour = "black") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     limits = c(0, 1)) +
+  scale_x_continuous(breaks = c(368, 736, 1000, 1472, 2500, 3680)) +
+  labs(
+    title    = "WAZ: Empirical Power Curves by Fixed-Effect Term",
+    subtitle = paste0(
+      "Lines = logistic fit [logit(reject) ~ log(N)]; points = empirical power ± 95% CI; ",
+      "dashed = 80% threshold; dotted verticals = estimated N for 80% power; ",
+      "α = ", ALPHA, "; R = ", R_REPS_MAIN, " reps"
+    ),
+    x      = "Sample size (N)",
+    y      = "Power",
+    colour = "Fixed-effect term"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "bottom")
+```
+
+## 14c. N-for-80%-Power Summary Table
+
+```{r chunk-14c-n80-table}
+n80_table_WAZ <- power_curves_WAZ %>%
+  dplyr::select(term, n80) %>%
+  distinct() %>%
+  mutate(
+    n80_rounded    = ceiling(n80 / 10) * 10,
+    vs_real_study  = round(n80_rounded / N_TARGET, 2),
+    adequately_powered_at_736 = ifelse(n80_rounded <= N_TARGET, "Yes", "No")
+  ) %>%
+  arrange(n80_rounded)
+
+knitr::kable(
+  n80_table_WAZ,
+  digits  = 1,
+  col.names = c("Term", "N for 80% power (exact)",
+                "N for 80% power (rounded up)",
+                "As fraction of real study N",
+                "Adequately powered at N = 736?"),
+  caption = paste0(
+    "WAZ: Estimated sample size required for 80% power per fixed-effect term ",
+    "(logistic power curve; α = ", ALPHA, "; baseline RE scenario)"
+  )
+)
+```
+
+## 14d. Power Heat-Map — Term × RE Scenario
+
+```{r chunk-14d-power-heatmap-re, fig.width = 13, fig.height = 10}
+png("Power Heat-Map.png", width = 800, height = 600)
+power_re_WAZ <- re_results_df_WAZ %>%
+  filter(converged == TRUE, term %in% key_terms) %>%
+  group_by(re_group, re_scenario, term) %>%
+  summarise(
+    n_reps = n(),
+    power  = mean(p.value < ALPHA, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(re_scenario_clean = gsub("\n", " ", re_scenario))
+
+ggplot(power_re_WAZ,
+       aes(x = term, y = re_scenario_clean, fill = power)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = scales::percent(power, accuracy = 1)), size = 2.8) +
+  scale_fill_gradient2(
+    low      = "firebrick",
+    mid      = "lightyellow",
+    high     = "steelblue",
+    midpoint = 0.80,
+    limits   = c(0, 1),
+    labels   = scales::percent_format()
+  ) +
+  facet_wrap(~re_group, scales = "free_y", ncol = 1) +
+  labs(
+    title    = "WAZ Power Heat-Map: Fixed-Effect Term × RE Scenario",
+    subtitle = paste0(
+      "N = ", N_TARGET, "; α = ", ALPHA,
+      "; blue = high power; red = low power; Group D = worst-case combined; ",
+      "R = ", R_REPS_MAIN, " reps"
+    ),
+    x    = "Fixed-effect term",
+    y    = "RE Scenario",
+    fill = "Power"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 35, hjust = 1, size = 8),
+    axis.text.y = element_text(size = 7),
+    legend.position = "right"
+  )
+dev.off()
+```
+
+## 14e. Power vs Residual Noise (Group E)
+
+```{r chunk-14e-power-resid, fig.width = 11, fig.height = 6}
+png("Power vs Residual Noise.png", width = 800, height = 600)
+power_resid_WAZ <- resid_df_WAZ %>%
+  filter(converged == TRUE, term %in% key_terms) %>%
+  group_by(sigma_eps, eps_label, term) %>%
+  summarise(
+    n_reps   = n(),
+    power    = mean(p.value < ALPHA, na.rm = TRUE),
+    power_se = sqrt(power * (1 - power) / n_reps),
+    .groups  = "drop"
+  )
+
+ggplot(power_resid_WAZ,
+       aes(x = sigma_eps, y = power, colour = term)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2.5) +
+  geom_errorbar(aes(ymin = pmax(0, power - 1.96 * power_se),
+                    ymax = pmin(1, power + 1.96 * power_se)),
+                width = 0.03) +
+  geom_hline(yintercept = 0.80, linetype = "dashed", colour = "grey40") +
+  geom_vline(xintercept = 0.75, linetype = "longdash",
+             colour = "black", linewidth = 0.5) +
+  annotate("text", x = 0.75, y = 0.03,
+           label = "Baseline\n(σ_ε = 0.75)",
+           hjust = -0.08, size = 3, colour = "black") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     limits = c(0, 1)) +
+  scale_x_continuous(breaks = c(0.40, 0.60, 0.75, 1.00, 1.20, 1.60)) +
+  labs(
+    title    = "WAZ: Power vs Residual Noise Level (Group E)",
+    subtitle = paste0(
+      "N = ", N_TARGET, "; α = ", ALPHA,
+      "; dashed = 80% power threshold; R = ", R_REPS_MAIN, " reps; ",
+      "note: Uganda (0.15) and Zimbabwe (0.12) contrasts are smallest true effects"
+    ),
+    x      = "Residual SD (σ_ε)",
+    y      = "Power",
+    colour = "Fixed-effect term"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "bottom")
+dev.off()
+```
+
+---
+
+# 15. Reporting Summary — All Five Metrics
+
+```{r chunk-15-summary-table}
+# ── Power added to the comprehensive summary ─────────────────────────────────
+power_re_for_merge_WAZ <- power_re_WAZ %>%
+  dplyr::select(re_scenario_clean, term, power)
+
+summary_all_WAZ <- perf_re_WAZ %>%
+  filter(term %in% key_terms) %>%
+  mutate(
+    re_scenario_clean = gsub("\n", " ", re_scenario),
+    worst_case        = grepl("Worst-Case", re_scenario_clean),
+    flag_bias         = abs(bias)        > 0.05,
+    flag_cov          = coverage_95      < 0.93,
+    flag_conv         = convergence_rate < 0.90,
+    flag_power        = TRUE   # placeholder; filled after merge
+  ) %>%
+  left_join(power_re_for_merge_WAZ,
+            by = c("re_scenario_clean", "term")) %>%
+  mutate(
+    flag_power = power < 0.80,
+    any_flag   = flag_bias | flag_cov | flag_conv | flag_power
+  ) %>%
+  dplyr::select(re_group, re_scenario, term, n_reps,
+                bias, rmse, coverage_95, convergence_rate, power,
+                flag_bias, flag_cov, flag_conv, flag_power, any_flag)
+
+knitr::kable(
+  summary_all_WAZ %>%
+    dplyr::select(-flag_bias, -flag_cov, -flag_conv, -flag_power) %>%
+    arrange(any_flag, re_group, term),
+  digits  = 3,
+  caption = paste0(
+    "Comprehensive WAZ performance table — Groups A–D — five metrics ",
+    "(any_flag = TRUE: |bias| > 0.05, coverage < 93%, ",
+    "convergence < 90%, or power < 80%; α = ", ALPHA,
+    "; R = ", R_REPS_MAIN, " reps)"
+  )
+)
+```
+
+---
+
+# 16. Final WAZ Analysis
+
+```{r chunk-16-final-setup}
+library(tidyverse)
+library(lcmm)
+library(patchwork)
+
+# Pin select/filter to dplyr to avoid namespace conflicts
+select <- dplyr::select
+filter <- dplyr::filter
+```
+
+## 16a. Best-Performing Scenario
+
+```{r chunk-16a-best-scenario}
+cat("\n", strrep("=", 60), "\n")
+cat("Best-Performing WAZ Scenario\n")
+cat(strrep("=", 60), "\n")
+
+best_scenario_WAZ <- perf_crossed_WAZ %>%
+  filter(term %in% key_terms) %>%
+  group_by(N, n_label, re_group, re_scenario) %>%
+  summarise(
+    mean_rmse = mean(rmse,      na.rm = TRUE),
+    mean_bias = mean(abs(bias), na.rm = TRUE),
+    .groups   = "drop"
+  ) %>%
+  arrange(mean_rmse, mean_bias) %>%
+  slice(1)
+
+cat("Sample size label :", best_scenario_WAZ$n_label,                      "\n")
+cat("RE group          :", best_scenario_WAZ$re_group,                     "\n")
+cat("RE scenario       :", gsub("\n", " ", best_scenario_WAZ$re_scenario), "\n")
+cat("Mean RMSE         :", round(best_scenario_WAZ$mean_rmse, 4),          "\n")
+cat("Mean |Bias|       :", round(best_scenario_WAZ$mean_bias, 4),          "\n")
+```
+
+## 16b. Extract RE Parameters
+
+```{r chunk-16b-re-params}
+best_re_name_WAZ <- names(re_scenarios)[
+  sapply(re_scenarios, function(sc)
+    gsub("\n", " ", sc$label) == gsub("\n", " ", best_scenario_WAZ$re_scenario)
+  )
+]
+best_re_params_WAZ <- re_scenarios[[best_re_name_WAZ]]
+
+cat("RE scenario name  :", best_re_name_WAZ,            "\n")
+cat("  sigma_b0        :", best_re_params_WAZ$sigma_b0, "\n")
+cat("  sigma_b1        :", best_re_params_WAZ$sigma_b1, "\n")
+cat("  rho_b01         :", best_re_params_WAZ$rho_b01,  "\n")
+```
+
+## 16c. Generate Final Dataset
+
+```{r chunk-16c-final-data}
+set.seed(20260220)
+final_WAZ_data <- generate_WAZ_data(
+  N        = best_scenario_WAZ$N,
+  dropout  = 0.20,
+  sigma_b0 = best_re_params_WAZ$sigma_b0,
+  sigma_b1 = best_re_params_WAZ$sigma_b1,
+  rho_b01  = best_re_params_WAZ$rho_b01
+) %>%
+  filter(!is.na(outcome))
+
+cat("Total observations (after dropout) :", nrow(final_WAZ_data),                  "\n")
+cat("Unique children                    :", n_distinct(final_WAZ_data$child_id),    "\n")
+cat("Countries                          :", paste(sort(unique(final_WAZ_data$country)),
+                                                  collapse = ", "),                  "\n")
+cat("Age time points (months)           :", paste(sort(unique(final_WAZ_data$age_mo)),
+                                                  collapse = ", "),                  "\n")
+cat("WAZ range                          :", round(min(final_WAZ_data$outcome), 2),
+    "to", round(max(final_WAZ_data$outcome), 2),                                    "\n")
+cat("\nObservations per country:\n")
+print(table(final_WAZ_data$country))
+glimpse(final_WAZ_data)
+```
+
+## 16d. Fit LMM on Final Data
+
+```{r chunk-16d-lmm}
+final_model_WAZ <- fit_LMM_WAZ(final_WAZ_data)
+
+cat("\n=== Final WAZ LMM Summary ===\n")
+x
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+print(summary(final_model_WAZ))
+
+final_model_tidy_WAZ <- broom.mixed::tidy(final_model_WAZ, effects = "fixed") %>%
+  dplyr::select(term, estimate, std.error, statistic, p.value) %>%
+  left_join(
+    data.frame(term = names(true_values), truth = unname(true_values)),
+    by = "term"
+  ) %>%
+  mutate(bias = estimate - truth)
+
+knitr::kable(
+  final_model_tidy_WAZ,
+  digits  = 4,
+  caption = paste0(
+    "Final WAZ model: fixed-effect estimates vs true values (",
+    best_scenario_WAZ$n_label, "; ",
+    gsub("\n", " ", best_scenario_WAZ$re_scenario), ")"
+  )
+)
+```
+
+## 16e. Growth Mixture Model (GMM)
+
+```{r chunk-16e-gmm-prep}
+# ── Prepare fractional polynomial terms ──────────────────────────────────────
+final_WAZ_data <- final_WAZ_data %>%
+  mutate(
+    agemos_log = log(age_mo + 1),
+    agemos_inv = 1 / (age_mo + 1)
+  )
+
+frac_poly_formulaSimm <- outcome ~ age_mo + agemos_log + agemos_inv
+
+gmm_data_WAZ <- final_WAZ_data %>%
+  arrange(child_id, age_mo) %>%
+  mutate(id = as.integer(factor(child_id)), time = age_mo) %>%
+  dplyr::select(id, time, outcome, country, sex, age_mo,
+                agemos_log, agemos_inv, child_id) %>%
+  as.data.frame()
+
+cat("GMM dataset rows :", nrow(gmm_data_WAZ),          "\n")
+cat("Unique subjects  :", n_distinct(gmm_data_WAZ$id), "\n")
+```
+
+```{r chunk-16e-gmm-fit}
+# ── 1-class reference model ───────────────────────────────────────────────────
+cat("\nFitting 1-class model (reference LMM)...\n")
+fit_simpleSimm <- hlme(
+  fixed   = frac_poly_formulaSimm,
+  random  = ~ age_mo,
+  subject = "child_id",
+  ng      = 1,
+  idiag   = FALSE,
+  data    = final_WAZ_data
+)
+cat("  Done. Log-lik:", round(fit_simpleSimm$loglik, 2), "\n")
+summary(fit_simpleSimm)
+```
+
+```{r chunk-16e-gmm-grid, cache=TRUE}
+# ── Grid search for 3-class GMM ───────────────────────────────────────────────
+# idiag = FALSE : unstructured random-effects covariance
+# nwg   = TRUE  : class-specific random-effects variance
+set.seed(2025)
+fit_gmm_grid6Simm <- gridsearch(
+  rep     = 50,
+  maxiter = 20,
+  minit   = fit_simpleSimm,
+  hlme(
+    fixed    = frac_poly_formulaSimm,
+    mixture  = ~ age_mo + agemos_log + agemos_inv,
+    random   = ~ age_mo,
+    classmb  = ~ country,
+    ng       = 3,
+    nwg      = TRUE,
+    subject  = "child_id",
+    data     = final_WAZ_data,
+    idiag    = FALSE
+  )
+)
+summary(fit_gmm_grid6Simm)
+```
+
+```{r chunk-16e-gmm-kcomp, cache=TRUE}
+# ── K-class comparison (K = 1 to 4) ──────────────────────────────────────────
+cat("\nFitting K = 1–4 class models for comparison...\n")
+gmm_k1_WAZ <- hlme(fixed = outcome ~ time, random = ~ time,
+                    subject = "id", ng = 1, data = gmm_data_WAZ)
+
+fit_gmm_k_WAZ <- function(k, ref, data) {
+  m <- hlme(fixed = outcome ~ time, mixture = ~ time, random = ~ time,
+             subject = "id", ng = k, B = ref, data = data, verbose = FALSE)
+  cat(sprintf("  K=%d  LogLik=%.2f  AIC=%.2f  BIC=%.2f\n",
+              k, m$loglik, m$AIC, m$BIC))
+  m
+}
+
+gmm_k2_WAZ <- fit_gmm_k_WAZ(2, gmm_k1_WAZ, gmm_data_WAZ)
+gmm_k3_WAZ <- fit_gmm_k_WAZ(3, gmm_k1_WAZ, gmm_data_WAZ)
+gmm_k4_WAZ <- fit_gmm_k_WAZ(4, gmm_k1_WAZ, gmm_data_WAZ)
+
+gmm_list_WAZ <- list(K1 = gmm_k1_WAZ, K2 = gmm_k2_WAZ,
+                     K3 = gmm_k3_WAZ, K4 = gmm_k4_WAZ)
+n_subj_WAZ  <- n_distinct(gmm_data_WAZ$id)
+
+gmm_compare_WAZ <- purrr::imap_dfr(gmm_list_WAZ, function(m, nm) {
+  pp <- m$pprob
+  entr <- if (!is.null(pp) && ncol(pp) > 2) {
+    probs <- as.matrix(pp[, -1, drop = FALSE])
+    probs[probs < 1e-10] <- 1e-10
+    1 + sum(probs * log(probs), na.rm = TRUE) /
+        (n_subj_WAZ * log(ncol(probs)))
+  } else NA_real_
+  min_pct <- if (!is.null(pp) && ncol(pp) > 2) {
+    min(table(apply(as.matrix(pp[,-1,drop=FALSE]), 1, which.max))) /
+      n_subj_WAZ * 100
+  } else 100
+  tibble(Model = nm, K = m$ng,
+         LogLik = round(m$loglik,2), AIC = round(m$AIC,2), BIC = round(m$BIC,2),
+         Entropy = round(entr,3), Min_class_pct = round(min_pct,1))
+})
+
+knitr::kable(gmm_compare_WAZ,
+             caption = "WAZ GMM model fit comparison (WAZ ~ time, random slope)")
+
+best_k_WAZ  <- gmm_compare_WAZ %>% slice(which.min(BIC)) %>% pull(K)
+best_gmm_WAZ <- gmm_list_WAZ[[paste0("K", best_k_WAZ)]]
+cat(sprintf("\nBIC-selected model: K = %d classes\n", best_k_WAZ))
+```
+
+```{r chunk-16e-gmm-class-profiles}
+# ── Class membership & trajectory plots ──────────────────────────────────────
+print(summary(gmm_k4_WAZ))
+
+cat("\n=== Estimated Class Proportions ===\n")
+print(
+  gmm_k2_WAZ$pprob %>%
+    dplyr::select(-id) %>%
+    summarise(across(everything(), mean)) %>%
+    round(3)
+)
+
+post_class_WAZ <- gmm_k2_WAZ$pprob %>%
+  mutate(pred_class = apply(dplyr::select(., -id), 1, which.max))
+
+gmm_data_WAZ_classed <- gmm_data_WAZ %>%
+  left_join(post_class_WAZ %>% dplyr::select(id, pred_class), by = "id")
+
+cat("\nClass assignment counts:\n")
+print(table(gmm_data_WAZ_classed$pred_class[!duplicated(gmm_data_WAZ_classed$id)]))
+```
+
+```{r}
+# ── Extract ONLY class probability columns ─────────────────────
+post_probs <- gmm_k4_WAZ$pprob %>%
+  dplyr::select(starts_with("prob")) %>%   # <-- safer than -id
+  as.matrix()
+
+# Check rows sum to 1 (debug step)
+row_sums <- rowSums(post_probs)
+print(summary(row_sums))  # should be ~1
+
+# Avoid log(0)
+post_probs[post_probs == 0] <- 1e-10
+
+# Dimensions
+N <- nrow(post_probs)
+K <- ncol(post_probs)
+
+# ── Correct entropy (0–1 scale) ────────────────────────────────
+entropy_WAZ <- 1 + sum(post_probs * log(post_probs)) / (N * log(K))
+
+cat("\n=== Entropy (scaled 0–1) ===\n")
+print(round(entropy_WAZ, 3))
+```
+
+```{r chunk-16e-gmm-plots, fig.width = 11, fig.height = 8}
+traj_summary_WAZ <- gmm_data_WAZ_classed %>%
+  group_by(pred_class, time) %>%
+  summarise(mean_WAZ = mean(outcome, na.rm = TRUE),
+            se_WAZ   = sd(outcome, na.rm = TRUE) / sqrt(n()),
+            .groups  = "drop") %>%
+  mutate(Class = factor(paste0("Class ", pred_class)))
+
+p_traj_WAZ <- ggplot(traj_summary_WAZ,
+                     aes(x = time, y = mean_WAZ, colour = Class, fill = Class)) +
+  geom_ribbon(aes(ymin = mean_WAZ - 1.96*se_WAZ,
+                  ymax = mean_WAZ + 1.96*se_WAZ),
+              alpha = 0.15, colour = NA) +
+  geom_line(linewidth = 1.1) + geom_point(size = 2.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  labs(title   = sprintf("GMM: WAZ Growth Trajectories by Latent Class (K = %d)", best_k_WAZ),
+       subtitle = paste0("Best scenario: ", best_scenario_WAZ$n_label, " | ",
+                         gsub("\n", " ", best_scenario_WAZ$re_scenario)),
+       x = "Age (months)", y = "Mean WAZ (± 95% CI)",
+       colour = "Latent class", fill = "Latent class") +
+  theme_bw(base_size = 13) + theme(legend.position = "bottom")
+
+if (best_k_WAZ > 1) {
+  pp_long_WAZ <- best_gmm_WAZ$pprob %>%
+    dplyr::select(-id) %>%
+    pivot_longer(everything(), names_to = "Class", values_to = "PostProb")
+  p_pp_WAZ <- ggplot(pp_long_WAZ, aes(x = PostProb, fill = Class)) +
+    geom_histogram(binwidth = 0.05, colour = "white", alpha = 0.75,
+                   position = "identity") +
+    labs(title = "Posterior Class Membership Probabilities",
+         x = "Posterior probability", y = "Count", fill = "Class") +
+    theme_bw(base_size = 13) + theme(legend.position = "bottom")
+  print(p_traj_WAZ / p_pp_WAZ + plot_annotation(tag_levels = "A"))
+} else {
+  print(p_traj_WAZ)
+}
+```
+
+```{r chunk-16e-gmm-predicted-traj, fig.width = 11, fig.height = 7}
+# ── Predicted trajectories from grid-search GMM ──────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# Load required libraries
+# ─────────────────────────────────────────────────────────────
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+# ─────────────────────────────────────────────────────────────
+# 1. Create age sequence (0–60 months)
+# ─────────────────────────────────────────────────────────────
+agemos <- seq(0.5, 60, by = 0.5)
+
+# ─────────────────────────────────────────────────────────────
+# 2. Define coefficients from hlme model
+# ─────────────────────────────────────────────────────────────
+coef_class1 <- c(intercept = -2.60328, time = -0.01166,
+                 agemos_log =  1.74033, agemos_inv =  2.45116)
+
+coef_class2 <- c(intercept =  0.07704, time =  0.01629,
+                 agemos_log =  0.17560, agemos_inv = -0.17826)
+
+coef_class3 <- c(intercept = -0.09453, time = -0.04553,
+                 agemos_log =  0.18647, agemos_inv = -0.17037)
+
+coef_class4 <- c(intercept =  2.54863, time = -0.00320,
+                 agemos_log = -1.49004, agemos_inv = -2.99954)
+
+# ─────────────────────────────────────────────────────────────
+# 3. Generate prediction dataset
+# ─────────────────────────────────────────────────────────────
+pred_data <- data.frame(agemos = agemos) %>%
+  mutate(
+    time = agemos,
+    agemos_log = log(agemos + 1),
+    agemos_inv = 1 / (agemos + 1)
+  ) %>%
+  rowwise() %>%
+  mutate(
+    class1 = coef_class1["intercept"] +
+             coef_class1["time"] * time +
+             coef_class1["agemos_log"] * agemos_log +
+             coef_class1["agemos_inv"] * agemos_inv,
+
+    class2 = coef_class2["intercept"] +
+             coef_class2["time"] * time +
+             coef_class2["agemos_log"] * agemos_log +
+             coef_class2["agemos_inv"] * agemos_inv,
+
+    class3 = coef_class3["intercept"] +
+             coef_class3["time"] * time +
+             coef_class3["agemos_log"] * agemos_log +
+             coef_class3["agemos_inv"] * agemos_inv,
+
+    class4 = coef_class4["intercept"] +
+             coef_class4["time"] * time +
+             coef_class4["agemos_log"] * agemos_log +
+             coef_class4["agemos_inv"] * agemos_inv
+  ) %>%
+  ungroup()
+
+# ─────────────────────────────────────────────────────────────
+# 4. Convert to long format
+# ─────────────────────────────────────────────────────────────
+pred_long <- pred_data %>%
+  pivot_longer(
+    cols = starts_with("class"),
+    names_to = "Class",
+    values_to = "WAZ"
+  )
+
+# ─────────────────────────────────────────────────────────────
+# 5. Label trajectory classes (interpretation-based)
+# ─────────────────────────────────────────────────────────────
+pred_long <- pred_long %>%
+  mutate(
+    Class = recode(Class,
+      class1 = "Improving",
+      class2 = "Gradual improving",
+      class3 = "Declining",
+      class4 = "High  declining"
+    )
+  )
+
+# ─────────────────────────────────────────────────────────────
+# 6. Plot trajectories
+# ─────────────────────────────────────────────────────────────
+ggplot(pred_long, aes(x = agemos, y = WAZ, color = Class)) +
+  geom_line(linewidth = 1.2) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(
+    x = "Age (months)",
+    y = "Predicted weight-for-age z-score (WAZ)",
+    color = "Growth trajectory"
+  ) +
+  theme_minimal(base_size = 14)
+```
+
+```{r chunk-16e-gmm-postprob}
+# ── Classification quality ────────────────────────────────────────────────────
+postprob(best_gmm_WAZ)
+
+posterior_WAZ <- best_gmm_WAZ$pprob
+summary(posterior_WAZ[, c("class", "prob1", "prob2", "prob3", "prob4")])
+
+# ── Class × country profile ───────────────────────────────────────────────────
+class_profile_WAZ <- gmm_data_WAZ_classed %>%
+  filter(!duplicated(id)) %>%
+  count(pred_class, country) %>%
+  group_by(pred_class) %>%
+  mutate(pct = round(100 * n / sum(n), 1)) %>%
+  ungroup()
+
+knitr::kable(class_profile_WAZ,
+             col.names = c("Class", "Country", "N", "%"),
+             caption   = "WAZ class membership by country")
+
+cat("\n", strrep("=", 60), "\n")
+cat("WAZ ANALYSIS COMPLETE\n")
+cat(strrep("=", 60), "\n")
+cat(sprintf("LMM fitted on %d obs from %d children.\n",
+            nrow(final_WAZ_data), n_distinct(final_WAZ_data$child_id)))
+cat(sprintf("BIC-selected GMM: K = %d latent trajectory classes.\n", best_k_WAZ))
+cat("Key fit metrics for best WAZ GMM:\n")
+print(filter(gmm_compare_WAZ, K == best_k_WAZ))
+```
+
+---
+
+# 17. Session Info
+
+```{r chunk-17-session}
+sessionInfo()
+```
+
+
+
+```{r}
+# =============================================================================
+# WAZ — BEST CROSSED SCENARIO: DATA GENERATION, LMM, GMM & EXPORT  (v2)
+#
+# Updated to match the improved WAZ simulation (K=1000, Groups A–D, Group E,
+# coverage + convergence metrics).
+#
+# WAZ-specific differences from the HAZ version:
+#   • true_values: β₀=-0.30, β₁=-0.010, β₂=0.20, β₃=-0.08
+#                  SA=+0.55, UG=+0.15, ZW=+0.12
+#   • sigma_eps default = 0.75  (HAZ = 0.80)
+#   • generate_WAZ_data() / fit_LMM_WAZ()
+#   • perf_crossed_WAZ (not HAZ)
+#   • Wasting threshold annotated at HAZ < -2 (same numeric, different label)
+#   • Output folder: WAZ_best_scenario_outputs_v2/
+#
+# Selection criterion:
+#   Best crossed cell = lowest mean RMSE across key_terms,
+#   tie-broken by: (1) highest mean coverage_95, (2) lowest mean |bias|.
+#   Cells where mean convergence_rate < 0.90 are excluded first.
+#
+# Prerequisites — all must exist in the environment:
+#   perf_crossed_WAZ    (from chunk-.
+#   re_scenarios        (from chunk-10a-re-define)
+#   key_terms           (from chunk-10c-re-performance)
+#   true_values         (from chunk-6-true-values)
+#   generate_WAZ_data() fit_LMM_WAZ()
+# =============================================================================
+
+library(tidyverse)
+library(lme4)
+library(lmerTest)
+library(broom.mixed)
+library(lcmm)
+library(knitr)
+library(patchwork)
+
+# pin dplyr verbs to avoid MASS / lcmm namespace conflicts
+select <- dplyr::select
+filter <- dplyr::filter
+
+# ── Output directory ──────────────────────────────────────────────────────────
+OUT_DIR <- "WAZ_best_scenario_outputs_v2"
+if (!dir.exists(OUT_DIR)) dir.create(OUT_DIR)
+
+# =============================================================================
+# STEP 1 — Identify the best crossed scenario
+#
+#   Exclusion : cells with mean convergence_rate < 0.90 (unreliable estimates)
+#   Primary   : lowest mean RMSE across key_terms
+#   Tie-break 1: highest mean coverage_95
+#   Tie-break 2: lowest mean |bias|
+# =============================================================================
+cat("\n", strrep("=", 60), "\n")
+cat("STEP 1: Identify Best Crossed Scenario\n")
+cat(strrep("=", 60), "\n")
+
+# Confirm perf_crossed_WAZ has the expected v2 columns
+expected_cols <- c("N", "n_label", "re_group", "re_scenario", "term",
+                   "bias", "rmse", "coverage_95", "convergence_rate")
+missing_cols  <- setdiff(expected_cols, names(perf_crossed_WAZ))
+if (length(missing_cols) > 0) {
+  stop(
+    "perf_crossed_WAZ is missing columns: ",
+    paste(missing_cols, collapse = ", "),
+    "\nMake sure you are using the updated WAZ simulation script (v2 / K=1000)."
+  )
+}
+
+best_scenario_WAZ <- perf_crossed_WAZ %>%
+  filter(term %in% key_terms) %>%
+  group_by(N, n_label, re_group, re_scenario) %>%
+  summarise(
+    mean_rmse        = mean(rmse,             na.rm = TRUE),
+    mean_bias        = mean(abs(bias),        na.rm = TRUE),
+    mean_coverage    = mean(coverage_95,      na.rm = TRUE),
+    mean_convergence = mean(convergence_rate, na.rm = TRUE),
+    .groups          = "drop"
+  ) %>%
+  # Exclude poorly converging cells
+  filter(mean_convergence >= 0.90) %>%
+  arrange(mean_rmse, desc(mean_coverage), mean_bias) %>%
+  slice(1)
+
+if (nrow(best_scenario_WAZ) == 0) {
+  stop("No crossed cell survived the convergence filter (>= 90%). ",
+       "Lower the threshold or inspect convergence_rate in perf_crossed_WAZ.")
+}
+
+cat("Selected scenario\n")
+cat("  Sample-size label :", best_scenario_WAZ$n_label,                           "\n")
+cat("  RE group          :", best_scenario_WAZ$re_group,                          "\n")
+cat("  RE scenario       :", gsub("\n", " ", best_scenario_WAZ$re_scenario),      "\n")
+cat("  Mean RMSE         :", round(best_scenario_WAZ$mean_rmse,        4),        "\n")
+cat("  Mean |Bias|       :", round(best_scenario_WAZ$mean_bias,        4),        "\n")
+cat("  Mean Coverage 95% :", round(best_scenario_WAZ$mean_coverage,    4),        "\n")
+cat("  Mean Convergence  :", round(best_scenario_WAZ$mean_convergence, 4),        "\n")
+
+# =============================================================================
+# STEP 2 — Retrieve RE parameters for the best scenario
+# =============================================================================
+cat("\n", strrep("=", 60), "\n")
+cat("STEP 2: Retrieve RE Parameters\n")
+cat(strrep("=", 60), "\n")
+
+best_re_name_WAZ <- names(re_scenarios)[
+  sapply(re_scenarios, function(sc)
+    gsub("\n", " ", sc$label) == gsub("\n", " ", best_scenario_WAZ$re_scenario)
+  )
+]
+
+if (length(best_re_name_WAZ) == 0) {
+  stop(
+    "Could not match RE scenario label '",
+    gsub("\n", " ", best_scenario_WAZ$re_scenario),
+    "' to any entry in re_scenarios.\n",
+    "Available labels:\n  ",
+    paste(sapply(re_scenarios, function(s) gsub("\n", " ", s$label)),
+          collapse = "\n  ")
+  )
+}
+
+best_re_params_WAZ <- re_scenarios[[best_re_name_WAZ]]
+
+cat("RE scenario name :", best_re_name_WAZ,                  "\n")
+cat("  sigma_b0       :", best_re_params_WAZ$sigma_b0,       "\n")
+cat("  sigma_b1       :", best_re_params_WAZ$sigma_b1,       "\n")
+cat("  rho_b01        :", best_re_params_WAZ$rho_b01,        "\n")
+cat("  RE group       :", best_re_params_WAZ$group,          "\n")
+
+# sigma_eps: crossed grid uses the WAZ default (0.75).
+# Update this value if a non-default Group E scenario is preferred.
+sigma_eps_final_WAZ <- 0.75
+cat("  sigma_eps      :", sigma_eps_final_WAZ,
+    "(WAZ default; Group E not crossed)\n")
+
+# =============================================================================
+# STEP 3 — Generate the final analysis dataset
+# =============================================================================
+cat("\n", strrep("=", 60), "\n")
+cat("STEP 3: Generate Final Dataset\n")
+cat(strrep("=", 60), "\n")
+
+set.seed(20260220)
+
+final_WAZ_data <- generate_WAZ_data(
+  N         = best_scenario_WAZ$N,
+  dropout   = 0.20,
+  sigma_b0  = best_re_params_WAZ$sigma_b0,
+  sigma_b1  = best_re_params_WAZ$sigma_b1,
+  rho_b01   = best_re_params_WAZ$rho_b01,
+  sigma_eps = sigma_eps_final_WAZ          # explicit v2 argument
+) %>%
+  filter(!is.na(outcome)) %>%
+  mutate(
+    agemos_log = log(age_mo + 1),          # fractional polynomial terms
+    agemos_inv = 1 / (age_mo + 1)          # needed by GMM
+  )
+
+# ── Sanity checks ─────────────────────────────────────────────────────────────
+cat("Total observations (post-dropout) :", nrow(final_WAZ_data),                        "\n")
+cat("Unique children                   :", n_distinct(final_WAZ_data$child_id),          "\n")
+cat("Countries                         :", paste(sort(unique(final_WAZ_data$country)),
+                                                 collapse = ", "),                        "\n")
+cat("Age time-points (months)          :", paste(sort(unique(final_WAZ_data$age_mo)),
+                                                 collapse = ", "),                        "\n")
+cat("WAZ range                         :",
+    round(min(final_WAZ_data$outcome), 2), "to",
+    round(max(final_WAZ_data$outcome), 2),                                                "\n")
+cat("Observations per country:\n")
+print(table(final_WAZ_data$country))
+
+# ── Export dataset ────────────────────────────────────────────────────────────
+write.csv(final_WAZ_data,
+          file.path(OUT_DIR, "final_WAZ_data.csv"),
+          row.names = FALSE)
+saveRDS(final_WAZ_data,
+        file.path(OUT_DIR, "final_WAZ_data.rds"))
+cat("\nDataset saved to", OUT_DIR, "(CSV + RDS)\n")
+
+# =============================================================================
+# STEP 4 — Linear Mixed Model (LMM)
+# =============================================================================
+cat("\n", strrep("=", 60), "\n")
+cat("STEP 4: Linear Mixed Model\n")
+cat(strrep("=", 60), "\n")
+
+final_model_WAZ <- fit_LMM_WAZ(final_WAZ_data)
+
+# Convergence check
+lmm_converged_WAZ <- is.null(attr(final_model_WAZ, "converge_warning")) &&
+                       !isSingular(final_model_WAZ)
+cat("LMM convergence status:", ifelse(lmm_converged_WAZ, "OK", "WARNING"), "\n")
+if (!lmm_converged_WAZ)
+  cat("  Warning:", attr(final_model_WAZ, "converge_warning"), "\n")
+
+cat("\n--- LMM Summary ---\n")
+print(summary(final_model_WAZ))
+
+# Fixed effects: estimate, SE, bias vs truth, 95% CI, coverage flag
+lmm_tidy_WAZ <- broom.mixed::tidy(final_model_WAZ, effects = "fixed") %>%
+  select(term, estimate, std.error, statistic, p.value) %>%
+  left_join(
+    tibble(term = names(true_values), truth = unname(true_values)),
+    by = "term"
+  ) %>%
+  mutate(
+    bias      = round(estimate - truth, 4),
+    ci_lo     = estimate - 1.96 * std.error,
+    ci_hi     = estimate + 1.96 * std.error,
+    ci_covers = truth >= ci_lo & truth <= ci_hi,
+    sig_p05   = p.value < 0.05
+  )
+
+cat("\n--- Fixed Effects vs True Values ---\n")
+print(knitr::kable(
+  lmm_tidy_WAZ,
+  digits  = 4,
+  caption = paste0(
+    "WAZ LMM fixed effects (estimate, SE, bias, 95% CI, coverage flag) — ",
+    best_scenario_WAZ$n_label, " | ",
+    gsub("\n", " ", best_scenario_WAZ$re_scenario)
+  )
+))
+
+# Random-effects variance components
+re_summary_WAZ <- as.data.frame(VarCorr(final_model_WAZ))
+cat("\n--- Random-Effects Variance Components ---\n")
+print(re_summary_WAZ)
+
+# ── Export LMM ────────────────────────────────────────────────────────────────
+write.csv(lmm_tidy_WAZ,
+          file.path(OUT_DIR, "lmm_fixed_effects.csv"),
+          row.names = FALSE)
+write.csv(re_summary_WAZ,
+          file.path(OUT_DIR, "lmm_random_effects.csv"),
+          row.names = FALSE)
+saveRDS(final_model_WAZ,
+        file.path(OUT_DIR, "lmm_model_object.rds"))
+cat("LMM results saved to", OUT_DIR, "\n")
+
+# =============================================================================
+# STEP 5 — Growth Mixture Model (GMM)
+# =============================================================================
+cat("\n", strrep("=", 60), "\n")
+cat("STEP 5: Growth Mixture Model\n")
+cat(strrep("=", 60), "\n")
+
+# lcmm requires a plain data.frame with integer subject ID
+gmm_data_WAZ <- final_WAZ_data %>%
+  arrange(child_id, age_mo) %>%
+  mutate(id = as.integer(factor(child_id))) %>%
+  select(id,
+         time       = age_mo,
+         outcome,
+         agemos_log,
+         agemos_inv,
+         country,
+         sex) %>%
+  as.data.frame()
+
+cat("GMM dataset:", nrow(gmm_data_WAZ), "rows |",
+    n_distinct(gmm_data_WAZ$id), "subjects\n")
+
+frac_poly_formula_WAZ <- outcome ~ time + agemos_log + agemos_inv
+
+# ── 5a. 1-class reference model ───────────────────────────────────────────────
+cat("\nFitting 1-class reference model...\n")
+gmm_k1_WAZ <- hlme(
+  fixed   = frac_poly_formula_WAZ,
+  random  = ~ time,
+  subject = "id",
+  ng      = 1,
+  idiag   = FALSE,
+  data    = gmm_data_WAZ
+)
+cat("  Log-lik:", round(gmm_k1_WAZ$loglik, 2), "\n")
+
+# ── 5b. Helper: K-class GMM via gridsearch ────────────────────────────────────
+# idiag = FALSE : unstructured RE covariance
+# nwg   = TRUE  : class-specific RE variance
+# classmb = ~ country: class membership modelled by country
+fit_gmm_WAZ <- function(k, ref_model, data, formula, reps = 50) {
+  cat(sprintf("\nFitting %d-class GMM (gridsearch reps = %d)...\n", k, reps))
+  m <- gridsearch(
+    rep     = reps,
+    maxiter = 20,
+    minit   = ref_model,
+    hlme(
+      fixed    = formula,
+      mixture  = ~ time + agemos_log + agemos_inv,
+      random   = ~ time,
+      classmb  = ~ country,
+      ng       = k,
+      nwg      = TRUE,
+      idiag    = FALSE,
+      subject  = "id",
+      data     = data
+    )
+  )
+  cat(sprintf("  Log-lik: %.2f | AIC: %.2f | BIC: %.2f\n",
+              m$loglik, m$AIC, m$BIC))
+  m
+}
+
+set.seed(20260220)
+gmm_k2_WAZ <- fit_gmm_WAZ(2, gmm_k1_WAZ, gmm_data_WAZ, frac_poly_formula_WAZ)
+gmm_k3_WAZ <- fit_gmm_WAZ(3, gmm_k1_WAZ, gmm_data_WAZ, frac_poly_formula_WAZ)
+gmm_k4_WAZ <- fit_gmm_WAZ(4, gmm_k1_WAZ, gmm_data_WAZ, frac_poly_formula_WAZ)
+
+# ── 5c. Model comparison table ────────────────────────────────────────────────
+n_subj_WAZ   <- n_distinct(gmm_data_WAZ$id)
+gmm_list_WAZ <- list(K1 = gmm_k1_WAZ, K2 = gmm_k2_WAZ,
+                     K3 = gmm_k3_WAZ, K4 = gmm_k4_WAZ)
+
+compute_entropy_WAZ <- function(m) {
+  pp <- m$pprob
+  if (is.null(pp) || ncol(pp) <= 2) return(NA_real_)
+  probs <- as.matrix(pp[, -1, drop = FALSE])
+  probs[probs < 1e-10] <- 1e-10
+  1 + sum(probs * log(probs), na.rm = TRUE) /
+      (n_subj_WAZ * log(ncol(probs)))
+}
+
+compute_min_class_pct_WAZ <- function(m) {
+  pp <- m$pprob
+  if (is.null(pp) || ncol(pp) <= 2) return(100)
+  cls <- apply(as.matrix(pp[, -1, drop = FALSE]), 1, which.max)
+  min(table(cls)) / n_subj_WAZ * 100
+}
+
+gmm_compare_WAZ <- imap_dfr(gmm_list_WAZ, function(m, nm) {
+  tibble(
+    Model         = nm,
+    K             = m$ng,
+    LogLik        = round(m$loglik,                    2),
+    AIC           = round(m$AIC,                       2),
+    BIC           = round(m$BIC,                       2),
+    Entropy       = round(compute_entropy_WAZ(m),       3),
+    Min_class_pct = round(compute_min_class_pct_WAZ(m), 1)
+  )
+})
+
+cat("\n--- GMM Model Comparison ---\n")
+print(knitr::kable(
+  gmm_compare_WAZ,
+  caption = "WAZ GMM fit indices — WAZ ~ time + log(time+1) + 1/(time+1)"
+))
+
+# ── 5d. Select best GMM by BIC ────────────────────────────────────────────────
+best_k_WAZ   <- gmm_compare_WAZ %>% slice(which.min(BIC)) %>% pull(K)
+best_gmm_WAZ <- gmm_list_WAZ[[paste0("K", best_k_WAZ)]]
+cat(sprintf("\nBIC-selected model: K = %d classes\n", best_k_WAZ))
+
+cat("\n--- Best GMM Summary ---\n")
+print(summary(best_gmm_WAZ))
+
+cat("\n--- Posterior Classification Quality ---\n")
+print(postprob(best_gmm_WAZ))
+
+# ── 5e. Assign posterior class membership ─────────────────────────────────────
+post_class_WAZ <- best_gmm_WAZ$pprob %>%
+  mutate(pred_class = apply(select(., -id), 1, which.max))
+
+gmm_data_WAZ_classed <- gmm_data_WAZ %>%
+  left_join(post_class_WAZ %>% select(id, pred_class), by = "id")
+
+cat("\nClass assignment counts (per subject):\n")
+print(table(gmm_data_WAZ_classed$pred_class[!duplicated(gmm_data_WAZ_classed$id)]))
+
+# ── 5f. Trajectory plot ───────────────────────────────────────────────────────
+traj_summary_WAZ <- gmm_data_WAZ_classed %>%
+  group_by(pred_class, time) %>%
+  summarise(
+    mean_WAZ = mean(outcome, na.rm = TRUE),
+    se_WAZ   = sd(outcome,   na.rm = TRUE) / sqrt(n()),
+    .groups  = "drop"
+  ) %>%
+  mutate(Class = factor(paste0("Class ", pred_class)))
+
+p_traj_WAZ <- ggplot(traj_summary_WAZ,
+                     aes(x = time, y = mean_WAZ,
+                         colour = Class, fill = Class)) +
+  geom_ribbon(aes(ymin = mean_WAZ - 1.96 * se_WAZ,
+                  ymax = mean_WAZ + 1.96 * se_WAZ),
+              alpha = 0.15, colour = NA) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2.5) +
+  geom_hline(yintercept =  0, linetype = "dashed", colour = "grey50") +
+  geom_hline(yintercept = -2, linetype = "dashed", colour = "firebrick",
+             linewidth = 0.7) +
+  annotate("text", x = 55, y = -2.1,
+           label = "Wasting threshold (WAZ < -2)",
+           colour = "firebrick", size = 3.2, hjust = 1) +
+  scale_x_continuous(breaks = seq(0, 60, 6)) +
+  labs(
+    title    = sprintf("WAZ Growth Trajectories by Latent Class (K = %d)", best_k_WAZ),
+    subtitle = paste0(best_scenario_WAZ$n_label, " | ",
+                      gsub("\n", " ", best_scenario_WAZ$re_scenario),
+                      " | σ_ε = ", sigma_eps_final_WAZ),
+    x        = "Age (months)",
+    y        = "Mean WAZ ± 95% CI",
+    colour   = "Latent class",
+    fill     = "Latent class"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(legend.position = "bottom")
+
+# Posterior probability histogram
+if (best_k_WAZ > 1) {
+  pp_long_WAZ <- best_gmm_WAZ$pprob %>%
+    select(-id) %>%
+    pivot_longer(everything(),
+                 names_to  = "Class",
+                 values_to = "PostProb")
+
+  p_pp_WAZ <- ggplot(pp_long_WAZ, aes(x = PostProb, fill = Class)) +
+    geom_histogram(binwidth = 0.05, colour = "white",
+                   alpha = 0.75, position = "identity") +
+    labs(title = "Posterior Class Membership Probabilities",
+         x = "Posterior probability", y = "Count", fill = "Class") +
+    theme_bw(base_size = 13) +
+    theme(legend.position = "bottom")
+
+  gmm_plot_WAZ <- p_traj_WAZ / p_pp_WAZ + plot_annotation(tag_levels = "A")
+} else {
+  gmm_plot_WAZ <- p_traj_WAZ
+}
+
+print(gmm_plot_WAZ)
+
+# ── 5g. Class × country profile ───────────────────────────────────────────────
+class_profile_WAZ <- gmm_data_WAZ_classed %>%
+  filter(!duplicated(id)) %>%
+  count(pred_class, country) %>%
+  group_by(pred_class) %>%
+  mutate(pct = round(100 * n / sum(n), 1)) %>%
+  ungroup()
+
+cat("\n--- Class Profile by Country ---\n")
+print(knitr::kable(
+  class_profile_WAZ,
+  col.names = c("Class", "Country", "N", "%"),
+  caption   = "WAZ class membership by country"
+))
+
+# ── 5h. Export GMM ────────────────────────────────────────────────────────────
+write.csv(gmm_compare_WAZ,
+          file.path(OUT_DIR, "gmm_model_comparison.csv"),
+          row.names = FALSE)
+write.csv(gmm_data_WAZ_classed,
+          file.path(OUT_DIR, "gmm_data_with_classes.csv"),
+          row.names = FALSE)
+write.csv(class_profile_WAZ,
+          file.path(OUT_DIR, "gmm_class_country_profile.csv"),
+          row.names = FALSE)
+saveRDS(best_gmm_WAZ,
+        file.path(OUT_DIR, "gmm_best_model_object.rds"))
+ggsave(file.path(OUT_DIR, "gmm_trajectory_plot.png"),
+       plot = gmm_plot_WAZ, width = 11, height = 8, dpi = 300)
+cat("GMM results saved to", OUT_DIR, "\n")
+
+# =============================================================================
+# SUMMARY
+# =============================================================================
+cat("\n", strrep("=", 60), "\n")
+cat("WAZ ANALYSIS COMPLETE\n")
+cat(strrep("=", 60), "\n")
+cat(sprintf("Best scenario      : %s\n",   best_scenario_WAZ$n_label))
+cat(sprintf("RE scenario        : %s\n",   gsub("\n", " ", best_scenario_WAZ$re_scenario)))
+cat(sprintf("RE group           : %s\n",   best_scenario_WAZ$re_group))
+cat(sprintf("sigma_eps          : %.2f\n", sigma_eps_final_WAZ))
+cat(sprintf("N children         : %d\n",   n_distinct(final_WAZ_data$child_id)))
+cat(sprintf("N observations     : %d\n",   nrow(final_WAZ_data)))
+cat(sprintf("Mean RMSE          : %.4f\n", best_scenario_WAZ$mean_rmse))
+cat(sprintf("Mean Coverage 95%%  : %.4f\n", best_scenario_WAZ$mean_coverage))
+cat(sprintf("Mean Convergence   : %.4f\n", best_scenario_WAZ$mean_convergence))
+cat(sprintf("LMM convergence    : %s\n",
+            ifelse(lmm_converged_WAZ, "OK", "WARNING")))
+cat(sprintf("BIC-selected GMM   : K = %d classes\n", best_k_WAZ))
+cat("\nFiles written to:", normalizePath(OUT_DIR), "\n")
+cat("  final_WAZ_data.csv / .rds\n")
+cat("  lmm_fixed_effects.csv\n")
+cat("  lmm_random_effects.csv\n")
+cat("  lmm_model_object.rds\n")
+cat("  gmm_model_comparison.csv\n")
+cat("  gmm_data_with_classes.csv\n")
+cat("  gmm_class_country_profile.csv\n")
+cat("  gmm_best_model_object.rds\n")
+cat("  gmm_trajectory_plot.png\n")
+```
+
+
+```{r}
+# =============================================================================
+# GMM CLASS-SPECIFIC PARAMETER TABLE — WAZ (any K)
+#
+# Prerequisites in environment:
+#   best_gmm_WAZ   : fitted hlme object (lcmm)
+#   best_k_WAZ     : integer, number of latent classes
+#
+# lcmm does NOT store a $param data.frame.
+# summary(hlme_object) returns a MATRIX whose rownames are the parameter names.
+# This chunk extracts from that matrix directly.
+# =============================================================================
+
+library(lcmm)
+library(knitr)
+library(kableExtra)
+library(dplyr)
+library(stringr)
+
+select <- dplyr::select
+
+# =============================================================================
+# STEP 1 — Extract coefficient matrix from summary()
+# summary.hlme() returns a numeric matrix: rows = parameters, cols = coef/Se/...
+# =============================================================================
+
+gmm_sum <- summary(best_gmm_WAZ)   # matrix, rownames = parameter labels
+
+# DIAGNOSTIC — print so you can verify detection
+cat("\n--- class(gmm_sum) ---\n");           print(class(gmm_sum))
+cat("\n--- colnames(gmm_sum) ---\n");        print(colnames(gmm_sum))
+cat("\n--- ALL rownames(gmm_sum) ---\n");    print(rownames(gmm_sum))
+
+# Convert to data.frame with a 'name' column
+coef_df <- as.data.frame(gmm_sum, stringsAsFactors = FALSE) %>%
+  tibble::rownames_to_column("name")
+
+# Normalise column names (coef / Se  OR  Coef / Std.Err etc.)
+names(coef_df) <- tolower(names(coef_df))
+if ("std.err"  %in% names(coef_df)) coef_df <- rename(coef_df, se = std.err)
+if ("stderr"   %in% names(coef_df)) coef_df <- rename(coef_df, se = stderr)
+
+cat("\n--- coef_df column names ---\n");     print(names(coef_df))
+cat("\n--- head(coef_df, 30) ---\n");        print(head(coef_df, 30))
+
+# =============================================================================
+# STEP 2 — Isolate class-specific (mixture) parameter rows
+#
+# lcmm rowname formats observed across versions:
+#   "Ymix1: time"        "Ymix 1: time"
+#   "class1: time"       "Class 1: time"
+#   "intercept class1"   "intercept class 1"  (older format, space-separated)
+#
+# Strategy: try the colon-prefix format first; fall back to space-suffix.
+# =============================================================================
+
+colon_pattern <- regex("(ymix|class)\\s*([0-9]+)\\s*:", ignore_case = TRUE)
+space_pattern <- regex("(ymix|class)\\s*([0-9]+)$",      ignore_case = TRUE)
+
+has_colon <- any(str_detect(coef_df$name, colon_pattern))
+has_space <- any(str_detect(coef_df$name, space_pattern))
+
+if (has_colon) {
+  cat("\nDetected COLON-prefix naming convention (e.g. 'Ymix1: time')\n")
+  mixture_df <- coef_df %>%
+    filter(str_detect(name, colon_pattern)) %>%
+    mutate(
+      class_no = as.integer(str_extract(str_extract(name, colon_pattern), "[0-9]+")),
+      term_raw = str_trim(str_remove(name, colon_pattern))
+    )
+} else if (has_space) {
+  cat("\nDetected SPACE-suffix naming convention (e.g. 'intercept class1')\n")
+  mixture_df <- coef_df %>%
+    filter(str_detect(name, space_pattern)) %>%
+    mutate(
+      class_no = as.integer(str_extract(str_extract(name, space_pattern), "[0-9]+")),
+      term_raw = str_trim(str_remove(name, space_pattern))
+    )
+} else {
+  # Last resort: print all names and stop with a clear message
+  stop(
+    "Could not detect class-specific parameters in summary(best_gmm_WAZ).\n",
+    "All rownames found:\n  ",
+    paste(rownames(gmm_sum), collapse = "\n  "), "\n",
+    "Paste these names in your question so the pattern can be fixed."
+  )
+}
+
+# Normalise term names to the keys used in display_terms below
+mixture_df <- mixture_df %>%
+  mutate(term = case_when(
+    str_detect(term_raw, regex("intercept", ignore_case = TRUE)) ~ "intercept",
+    term_raw %in% c("time", "age_mo")                            ~ "time",
+    term_raw == "agemos_log"                                     ~ "agemos_log",
+    term_raw == "agemos_inv"                                     ~ "agemos_inv",
+    TRUE                                                         ~ term_raw
+  ))
+
+cat("\n--- mixture_df (detected class-specific params) ---\n")
+print(mixture_df %>% select(name, class_no, term, coef, se))
+
+if (nrow(mixture_df) == 0)
+  stop("mixture_df is empty after filtering. Check the diagnostic output above.")
+
+# =============================================================================
+# STEP 3 — Class proportions from posterior probabilities
+# =============================================================================
+
+pprob_mat      <- best_gmm_WAZ$pprob %>% select(-id) %>% as.matrix()
+assigned_class <- apply(pprob_mat, 1, which.max)
+class_pct      <- prop.table(table(assigned_class)) * 100
+class_pct      <- setNames(as.numeric(class_pct), names(class_pct))
+
+# =============================================================================
+# STEP 4 — Helper: significance stars via Wald z-test
+# =============================================================================
+
+add_stars <- function(est, se) {
+  z     <- abs(est / se)
+  stars <- dplyr::case_when(
+    z > qnorm(0.9995) ~ "***",
+    z > qnorm(0.995)  ~ "**",
+    z > qnorm(0.975)  ~ "*",
+    TRUE              ~ ""
+  )
+  paste0(formatC(est, digits = 3, format = "f"), stars)
+}
+
+# =============================================================================
+# STEP 5 — Terms to display + human-readable labels
+#           Edit display_terms / term_labels to match your model formula
+# =============================================================================
+
+display_terms <- c("intercept", "time", "agemos_log", "agemos_inv")
+
+term_labels <- c(
+  intercept  = "Intercept (baseline z-score)",
+  time       = "Time slope (z-score change per month)",
+  agemos_log = "Log(age + 1) slope",
+  agemos_inv = "1/(age + 1) slope"
+)
+
+# Keep only terms present in the fitted model
+display_terms <- display_terms[display_terms %in% unique(mixture_df$term)]
+
+if (length(display_terms) == 0)
+  stop("None of display_terms matched mixture_df$term. ",
+       "Unique terms found: ", paste(unique(mixture_df$term), collapse = ", "))
+
+# =============================================================================
+# STEP 6 — Build Estimate + SE rows for each term
+# =============================================================================
+
+build_term_block <- function(term_name) {
+  rows <- mixture_df %>%
+    filter(term == term_name) %>%
+    arrange(class_no)
+
+  if (nrow(rows) == 0) return(NULL)
+
+  est_vals <- sapply(seq_len(best_k_WAZ), function(k) {
+    r <- filter(rows, class_no == k)
+    if (nrow(r) == 0) return("\u2014")
+    add_stars(r$coef[1], r$se[1])
+  })
+
+  se_vals <- sapply(seq_len(best_k_WAZ), function(k) {
+    r <- filter(rows, class_no == k)
+    if (nrow(r) == 0) return("\u2014")
+    paste0("(", formatC(r$se[1], digits = 3, format = "f"), ")")
+  })
+
+  rbind(
+    c(Parameter = term_labels[term_name], est_vals),
+    c(Parameter = "\u00a0\u00a0\u00a0SE",  se_vals)  # non-breaking-space indent
+  )
+}
+
+blocks   <- lapply(display_terms, build_term_block)
+blocks   <- Filter(Negate(is.null), blocks)
+body_mat <- do.call(rbind, blocks)
+
+# =============================================================================
+# STEP 7 — Class membership proportion row
+# =============================================================================
+
+pct_vals <- sapply(seq_len(best_k_WAZ), function(k) {
+  pct <- class_pct[as.character(k)]
+  if (is.na(pct)) return("\u2014")
+  paste0(formatC(pct, digits = 1, format = "f"), "%")
+})
+
+final_mat   <- rbind(body_mat, c(Parameter = "Class membership", pct_vals))
+final_table <- as.data.frame(final_mat, stringsAsFactors = FALSE)
+
+# =============================================================================
+# STEP 8 — Column headers: bold class number, %, direction label
+# =============================================================================
+
+time_slopes <- mixture_df %>%
+  filter(term == "time") %>%
+  arrange(class_no) %>%
+  pull(coef)
+
+class_dir <- dplyr::case_when(
+  time_slopes >  0.002  ~ "Rising",
+  time_slopes < -0.002  ~ "Declining",
+  TRUE                  ~ "Stable"
+)
+
+col_headers <- sapply(seq_len(best_k_WAZ), function(k) {
+  pct_str <- if (!is.na(class_pct[as.character(k)]))
+    paste0("(", formatC(class_pct[as.character(k)], digits = 1, format = "f"), "%)")
+  else ""
+  dir_str <- if (k <= length(class_dir)) class_dir[k] else ""
+  paste0("<b>Class ", k, "</b><br>", pct_str, "<br><i>", dir_str, "</i>")
+})
+
+# =============================================================================
+# STEP 9 — Identify italic section-header rows (term label rows, not SE rows)
+# =============================================================================
+
+is_header   <- !str_starts(final_table$Parameter, "\u00a0") &
+                final_table$Parameter != "Class membership"
+header_rows <- which(is_header)
+
+# =============================================================================
+# STEP 10 — Render table
+# =============================================================================
+
+kbl(
+  final_table,
+  format    = "html",          # swap to "latex" for PDF output
+  escape    = FALSE,
+  align     = c("l", rep("c", best_k_WAZ)),
+  caption   = sprintf("GMM class-specific parameters \u2014 WAZ (K = %d)", best_k_WAZ),
+  col.names = c("", col_headers)
+) %>%
+  kable_classic(full_width = FALSE, html_font = "Times New Roman") %>%
+  row_spec(header_rows,
+           italic    = TRUE,
+           extra_css = "font-style: italic;") %>%
+  row_spec(0,
+           bold      = TRUE,
+           extra_css = "border-top: 2px solid black;") %>%
+  row_spec(nrow(final_table) - 1,
+           extra_css = "border-bottom: 1px solid black;") %>%
+  row_spec(nrow(final_table),
+           extra_css = "border-bottom: 2px solid black;") %>%
+  footnote(
+    general = paste0(
+      "*** p &lt; 0.001 &nbsp;&nbsp; ",
+      "** p &lt; 0.01 &nbsp;&nbsp; ",
+      "* p &lt; 0.05 (Wald z-test)"
+    ),
+    general_title     = "",
+    footnote_as_chunk = TRUE,
+    escape            = FALSE
+  )
+```
