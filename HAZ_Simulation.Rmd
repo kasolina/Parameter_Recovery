@@ -460,6 +460,7 @@ summarise_performance <- function(sim_results, label = "") {
 ```{r chunk-8a-baseline-sim, cache=TRUE}
 # NOTE: R_REPS_MAIN = 1000 — first run will take ~5–10 minutes depending on hardware.
 # All subsequent runs load instantly from cache.
+library(dplyr)
 sim_base_HAZ <- {
   cached <- cache_load("sim_base_HAZ_k1000")
   if (!is.null(cached)) {
@@ -495,6 +496,7 @@ knitr::kable(
 ```{r chunk-8b-coverage-plot, fig.width=9, fig.height=5}
 # Nominal coverage = 0.95; the shaded band shows ±2 × Monte Carlo SE.
 # With R = 1000, MC-SE = sqrt(0.95 * 0.05 / 1000) ≈ 0.007.
+library(ggplot2)
 mc_se <- sqrt(0.95 * 0.05 / R_REPS_MAIN)
 
 perf_base_HAZ %>%
@@ -607,6 +609,7 @@ knitr::kable(
 # 9. Sample-Size Scenarios
 
 ```{r chunk-9-n-scenarios, cache=TRUE}
+library(data.table)
 sample_size_scenarios <- list(
   list(N = round(N_TARGET * 0.5),
        label = "Half the Real Study (N = 368)"),
@@ -662,6 +665,7 @@ knitr::kable(
 ## 10a. Define the 16-Scenario Grid *(Groups A–D)*
 
 ```{r chunk-10a-re-define}
+library(purrr)
 # ── Groups A, B, C are unchanged from the original script ────────────────────
 # ── Group D (NEW): Worst-Case Combined scenarios ──────────────────────────────
 #
@@ -1571,6 +1575,7 @@ sessionInfo()
 ```{r chunk-13i-waz-scatter, fig.width = 12, fig.height = 7}
 png("HAZ trajectories.png", width = 800, height = 600)
 # Run once using the baseline simulation to generate a representative dataset
+library(MASS)
 set.seed(20260220)
 plot_data_HAZ <- generate_HAZ_data(N = N_TARGET, dropout = 0.20) %>%
   filter(!is.na(outcome))
@@ -1636,6 +1641,104 @@ cat("RE scenario name  :", best_re_name_HAZ,            "\n")
 cat("  sigma_b0        :", best_re_params_HAZ$sigma_b0, "\n")
 cat("  sigma_b1        :", best_re_params_HAZ$sigma_b1, "\n")
 cat("  rho_b01         :", best_re_params_HAZ$rho_b01,  "\n")
+```
+
+```{r}
+
+# ── Diagnostic: why does convergence drop at N=1472, High Variation? ──────────
+# Re-runs this specific scenario, but unlike run_simulation_HAZ() this wrapper
+# also retains isSingular() flags and the estimated random-slope variance
+# (sigma_b1^2) for every replication, so we can inspect *why* convergence
+# fails rather than just how often.
+library(dplyr)
+library(data.table)
+library(pbapply)
+library(MASS)
+library(lme4)
+
+diag_scenario <- list(
+  N        = 1472,
+  sigma_b0 = re_scenarios[["High Between-Child Variation"]]$sigma_b0,
+  sigma_b1 = re_scenarios[["High Between-Child Variation"]]$sigma_b1,
+  rho_b01  = re_scenarios[["High Between-Child Variation"]]$rho_b01
+)
+
+single_sim_diag <- function(N, sigma_b0, sigma_b1, rho_b01, sigma_eps = 0.80) {
+  dat   <- generate_HAZ_data(N = N, sigma_b0 = sigma_b0, sigma_b1 = sigma_b1,
+                              rho_b01 = rho_b01, sigma_eps = sigma_eps)
+  model <- fit_LMM_HAZ(dat)
+
+  if (is.null(model)) {
+    return(data.frame(converged = FALSE, singular = NA, sigma_b1_sq = NA_real_))
+  }
+
+  singular  <- isSingular(model)
+  converged <- is.null(attr(model, "converge_warning")) && !singular
+
+  vc          <- as.data.frame(VarCorr(model))
+  sigma_b1_sq <- vc$vcov[vc$grp == "child_id" & vc$var1 == "g1" & is.na(vc$var2)]
+  if (length(sigma_b1_sq) == 0) sigma_b1_sq <- NA_real_
+
+  data.frame(converged = converged, singular = singular, sigma_b1_sq = sigma_b1_sq)
+}
+
+cname_diag    <- "HAZ_diag_HighVar_N1472_k1000"
+diag_results  <- cache_load(cname_diag)
+if (is.null(diag_results)) {
+  message("Running convergence diagnostic (N = 1472, High Between-Child Variation, R = ",
+          R_REPS_MAIN, ") ...")
+  diag_results <- pblapply(seq_len(R_REPS_MAIN), function(i)
+    single_sim_diag(N        = diag_scenario$N,
+                     sigma_b0 = diag_scenario$sigma_b0,
+                     sigma_b1 = diag_scenario$sigma_b1,
+                     rho_b01  = diag_scenario$rho_b01)
+  ) %>% rbindlist(idcol = "rep", fill = TRUE)
+  cache_save(diag_results, cname_diag)
+} else {
+  message("Loaded convergence diagnostic from cache.")
+}
+
+# ── Summary counts ─────────────────────────────────────────────────────────────
+n_total     <- nrow(diag_results)
+n_converged <- sum(diag_results$converged, na.rm = TRUE)
+n_singular  <- sum(diag_results$singular,  na.rm = TRUE)
+n_boundary  <- sum(diag_results$sigma_b1_sq[diag_results$converged] <= 0.001, na.rm = TRUE)
+
+cat("\n", strrep("=", 60), "\n")
+cat("Convergence Diagnostic — High Between-Child Variation, N = 1472\n")
+cat(strrep("=", 60), "\n")
+cat(sprintf("Total replications                     : %d\n", n_total))
+cat(sprintf("Converged replications                 : %d (%.1f%%)\n",
+            n_converged, 100 * n_converged / n_total))
+cat(sprintf("Convergence FAILURE rate               : %.1f%%\n",
+            100 * (n_total - n_converged) / n_total))
+cat(sprintf("Singular fits (isSingular)             : %d of %d (%.1f%%)\n",
+            n_singular, n_total, 100 * n_singular / n_total))
+cat(sprintf("Converged reps with sigma_b1^2 <= 0.001: %d of %d (%.1f%%)\n",
+            n_boundary, n_converged, 100 * n_boundary / n_converged))
+```
+
+
+```{r}
+library(ggplot2)
+
+ggplot(diag_results %>% filter(converged == TRUE),
+       aes(x = sigma_b1_sq)) +
+  geom_histogram(bins = 40, fill = "steelblue", colour = "white") +
+  geom_vline(xintercept = diag_scenario$sigma_b1^2,
+             linetype = "dashed", colour = "red") +
+  geom_vline(xintercept = 0.001, linetype = "dotted", colour = "grey40") +
+  annotate("text", x = diag_scenario$sigma_b1^2, y = Inf,
+           label = paste0("True \u03c3\u2081\u00b2 = ", diag_scenario$sigma_b1^2),
+           colour = "red", vjust = 1.5, hjust = -0.05, size = 3) +
+  labs(
+    title    = "Distribution of Estimated Slope Variance (\u03c3\u2081\u00b2)",
+    subtitle = paste0("High Between-Child Variation, N = 1472 \u2014 ",
+                      n_converged, " converged / ", n_total, " total replications"),
+    x = expression(hat(sigma)[1]^2 ~ "(estimated slope variance)"),
+    y = "Count"
+  ) +
+  theme_bw()
 ```
 
 
@@ -2419,5 +2522,1215 @@ entropy_HAZ <- 1 + sum(post_probs * log(post_probs)) / (N * log(K))
 cat("\n=== Entropy (scaled 0–1) ===\n")
 print(round(entropy_HAZ, 3))
 ```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Here's the sensitivity-analysis chunk. It (1) builds Table 3 — the perturbation grid for β_SA, β_UG, β_ZW — (2) generates 100 new HUU populations per perturbation by overriding just that country's effect (same post-hoc technique used for the null scenario in §8c), (3) refits the GMM on each replicate using the previously selected class structure, and (4) summarises how stable the class proportions and trajectory slopes are relative to the calibrated baseline. This depends on objects from the "best scenario" block (best_gmm, best_k, frac_poly_formula, gmm_data, OUT_DIR) already having been run.
+
+
+```{r}
+# Explicit library calls — avoids "could not find function %>%" if this
+# chunk is run in a fresh session without the earlier tidyverse/dplyr chunks.
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+library(pbapply)
+library(data.table)
+library(lcmm)
+library(knitr)
+
+select <- dplyr::select
+filter <- dplyr::filter
+```
+
+Table 3 — Country-Effect Perturbation Grid
+```{r}
+# =============================================================================
+# TABLE 3 — COUNTRY-EFFECT PERTURBATION GRID
+# =============================================================================
+
+# Each country-contrast parameter is perturbed one at a time while holding
+# the other two at their calibrated values.
+#
+# SA: literature-derived 95% CI
+# UG: ±50% of calibrated value
+# ZW: ±50% of calibrated value
+#
+# Total = 7 scenarios:
+#   1 baseline
+#   2 SA perturbations
+#   2 UG perturbations
+#   2 ZW perturbations
+# =============================================================================
+
+calibrated <- c(
+  SA = 0.45,
+  UG = 0.20,
+  ZW = 0.15
+)
+
+perturbation_grid <- tribble(
+  ~scenario,              ~parameter, ~beta_SA, ~beta_UG, ~beta_ZW, ~source,
+
+  "Baseline (calibrated)", "none",
+  0.45, 0.20, 0.15,
+  "Calibrated value",
+
+  "SA low", "beta_SA",
+  0.30, 0.20, 0.15,
+  "Literature 95% CI (lower)",
+
+  "SA high", "beta_SA",
+  0.60, 0.20, 0.15,
+  "Literature 95% CI (upper)",
+
+  "UG low", "beta_UG",
+  0.45, 0.10, 0.15,
+  "±50% (no direct CI)",
+
+  "UG high", "beta_UG",
+  0.45, 0.30, 0.15,
+  "±50% (no direct CI)",
+
+  "ZW low", "beta_ZW",
+  0.45, 0.20, 0.075,
+  "±50% (no direct CI)",
+
+  "ZW high", "beta_ZW",
+  0.45, 0.20, 0.225,
+  "±50% (no direct CI)"
+)
+
+knitr::kable(
+  perturbation_grid,
+  digits = 4,
+  caption = paste0(
+    "Table 3. Country-effect perturbation grid used for the sensitivity analysis ",
+    "(one-parameter-at-a-time; other two country contrasts held at calibrated values)"
+  )
+)
+```
+Perturbed Data Generator
+
+```{r}
+# =============================================================================
+# GENERATE HAZ DATA UNDER COUNTRY-EFFECT PERTURBATIONS
+# =============================================================================
+
+generate_HAZ_perturbed <- function(
+    N        = N_TARGET,
+    dropout  = 0.20,
+    beta_SA  = 0.45,
+    beta_UG  = 0.20,
+    beta_ZW  = 0.15,
+    sigma_b0 = 0.6,
+    sigma_b1 = 0.02,
+    rho_b01  = 0.2,
+    sigma_eps = 0.80
+) {
+
+  # Generate the original simulated dataset
+  df <- generate_HAZ_data(
+    N         = N,
+    dropout   = dropout,
+    sigma_b0  = sigma_b0,
+    sigma_b1  = sigma_b1,
+    rho_b01   = rho_b01,
+    sigma_eps = sigma_eps
+  )
+
+  # Original country effects already embedded in outcome
+  effect_orig <- ifelse(
+    df$country == "South Africa",
+    0.45,
+    ifelse(
+      df$country == "Uganda",
+      0.20,
+      ifelse(
+        df$country == "Zimbabwe",
+        0.15,
+        0.00
+      )
+    )
+  )
+
+  # Perturbed country effects
+  effect_new <- ifelse(
+    df$country == "South Africa",
+    beta_SA,
+    ifelse(
+      df$country == "Uganda",
+      beta_UG,
+      ifelse(
+        df$country == "Zimbabwe",
+        beta_ZW,
+        0.00
+      )
+    )
+  )
+
+  # Remove original country contribution and replace with perturbed value
+  df$outcome <- df$outcome - effect_orig + effect_new
+
+  return(df)
+}
+```
+
+
+Run 100 Replicates × 7 Perturbation Scenarios
+```{r}
+
+# =============================================================================
+# NUMBER OF SENSITIVITY REPLICATES
+# =============================================================================
+
+R_SENS <- 100
+
+# =============================================================================
+# GMM SENSITIVITY FIT
+# =============================================================================
+#
+# IMPORTANT:
+# - No best_gmm warm start is used.
+# - Each simulated replicate is fitted independently.
+# - A 1-class model is first fitted.
+# - gridsearch() then obtains random/grid-search starting values for the
+#   K-class model.
+# - Errors are retained so failed fits can be diagnosed.
+# =============================================================================
+
+fit_gmm_sensitivity <- function(dat, k) {
+
+  # ---------------------------------------------------------------------------
+  # Prepare data
+  # ---------------------------------------------------------------------------
+
+  gmm_dat <- dat %>%
+    filter(!is.na(outcome)) %>%
+    arrange(child_id, age_mo) %>%
+    mutate(
+      id = as.integer(factor(child_id)),
+      agemos_log = log(age_mo + 1),
+      agemos_inv = 1 / (age_mo + 1)
+    ) %>%
+    select(
+      id,
+      time = age_mo,
+      outcome,
+      agemos_log,
+      agemos_inv,
+      country
+    ) %>%
+    as.data.frame()
+
+
+  # ---------------------------------------------------------------------------
+  # Check that the data are suitable for fitting
+  # ---------------------------------------------------------------------------
+
+  if (nrow(gmm_dat) == 0) {
+
+    return(
+      list(
+        converged = FALSE,
+        error = "No observations available after removing missing outcomes."
+      )
+    )
+  }
+
+  if (length(unique(gmm_dat$id)) < k) {
+
+    return(
+      list(
+        converged = FALSE,
+        error = paste0(
+          "Fewer subjects than requested classes: ",
+          length(unique(gmm_dat$id)),
+          " subjects for K = ",
+          k
+        )
+      )
+    )
+  }
+
+
+  # ---------------------------------------------------------------------------
+  # Step 1: Fit one-class model
+  # ---------------------------------------------------------------------------
+
+  m1 <- tryCatch(
+
+    hlme(
+      fixed   = outcome ~ time + agemos_log + agemos_inv,
+      random  = ~ time,
+      subject = "id",
+      data    = gmm_dat,
+      ng      = 1
+    ),
+
+    error = function(e) {
+
+      list(
+        error = paste0(
+          "1-class model failed: ",
+          conditionMessage(e)
+        )
+      )
+    }
+  )
+
+
+  # Stop if one-class model failed
+  if (!is.null(m1$error)) {
+
+    return(
+      list(
+        converged = FALSE,
+        error = m1$error
+      )
+    )
+  }
+
+
+  # ---------------------------------------------------------------------------
+  # Step 2: K-class GMM using gridsearch/random starts
+  # ---------------------------------------------------------------------------
+
+  m <- tryCatch(
+
+    lcmm::gridsearch(
+      rep     = 5,
+      maxiter = 10,
+      minit   = m1,
+
+      hlme(
+        fixed   = outcome ~ time + agemos_log + agemos_inv,
+        mixture = ~ time + agemos_log + agemos_inv,
+        random  = ~ time,
+        classmb = ~ country,
+        ng      = k,
+        nwg     = TRUE,
+        idiag   = FALSE,
+        subject = "id",
+        data    = gmm_dat
+      )
+    ),
+
+    error = function(e) {
+
+      list(
+        error = paste0(
+          "K-class gridsearch failed: ",
+          conditionMessage(e)
+        )
+      )
+    }
+  )
+
+
+  # ---------------------------------------------------------------------------
+  # Check gridsearch result
+  # ---------------------------------------------------------------------------
+
+  if (!is.null(m$error)) {
+
+    return(
+      list(
+        converged = FALSE,
+        error = m$error
+      )
+    )
+  }
+
+  if (is.null(m)) {
+
+    return(
+      list(
+        converged = FALSE,
+        error = "Gridsearch returned NULL."
+      )
+    )
+  }
+
+  if (is.null(m$best)) {
+
+    return(
+      list(
+        converged = FALSE,
+        error = "Gridsearch returned no coefficient vector."
+      )
+    )
+  }
+
+  if (is.null(m$loglik)) {
+
+    return(
+      list(
+        converged = FALSE,
+        error = "Gridsearch returned no log-likelihood."
+      )
+    )
+  }
+
+
+  # ---------------------------------------------------------------------------
+  # Check convergence
+  # ---------------------------------------------------------------------------
+
+  converged <- !is.null(m$conv) && m$conv == 1
+
+  if (!converged) {
+
+    return(
+      list(
+        converged = FALSE,
+        error = paste0(
+          "Model did not converge. conv = ",
+          ifelse(
+            is.null(m$conv),
+            "NULL",
+            as.character(m$conv)
+          )
+        )
+      )
+    )
+  }
+
+
+  # ---------------------------------------------------------------------------
+  # Posterior classification
+  # ---------------------------------------------------------------------------
+
+  pp <- m$pprob
+
+  prob_cols <- grep(
+    "^prob",
+    names(pp),
+    value = TRUE
+  )
+
+  if (length(prob_cols) != k) {
+
+    return(
+      list(
+        converged = FALSE,
+        error = paste0(
+          "Expected ",
+          k,
+          " posterior-probability columns but found ",
+          length(prob_cols)
+        )
+      )
+    )
+  }
+
+  postprob <- as.matrix(
+    pp[, prob_cols, drop = FALSE]
+  )
+
+  assigned_class <- apply(
+    postprob,
+    1,
+    which.max
+  )
+
+  cls_counts <- table(
+    factor(
+      assigned_class,
+      levels = seq_len(k)
+    )
+  )
+
+  props <- as.numeric(
+    cls_counts / sum(cls_counts)
+  )
+
+  names(props) <- as.character(seq_len(k))
+
+
+  # ---------------------------------------------------------------------------
+  # Class-specific time slopes
+  # ---------------------------------------------------------------------------
+
+  coefs <- m$best
+
+  time_slopes <- sapply(
+    seq_len(k),
+    function(cl) {
+
+      idx <- grep(
+        sprintf(
+          "time.{0,10}class.{0,5}%d|class.{0,5}%d.{0,10}time",
+          cl,
+          cl
+        ),
+        names(coefs),
+        ignore.case = TRUE,
+        perl = TRUE
+      )
+
+      if (length(idx) == 0) {
+
+        NA_real_
+
+      } else {
+
+        coefs[idx[1]]
+      }
+    }
+  )
+
+
+  # ---------------------------------------------------------------------------
+  # Return successful model
+  # ---------------------------------------------------------------------------
+
+  list(
+    converged   = TRUE,
+    loglik      = m$loglik,
+    BIC         = m$BIC,
+    class_props = props,
+    time_slopes = time_slopes
+  )
+}
+```
+
+
+
+````{r}
+# =============================================================================
+# RUN ONE SENSITIVITY SCENARIO
+# =============================================================================
+
+run_sensitivity_scenario <- function(row) {
+
+  cname <- paste0(
+    "HAZ_sensitivity_",
+    gsub("[^A-Za-z0-9]", "_", row$scenario),
+    "_R",
+    R_SENS
+  )
+
+  # ---------------------------------------------------------------------------
+  # Load cache if available
+  # ---------------------------------------------------------------------------
+
+  cached <- cache_load(cname)
+
+  if (!is.null(cached)) {
+
+    message(
+      "Loaded sensitivity scenario '",
+      row$scenario,
+      "' from cache."
+    )
+
+    return(cached)
+  }
+
+
+  # ---------------------------------------------------------------------------
+  # Scenario information
+  # ---------------------------------------------------------------------------
+
+  cat(
+    "\n============================================\n",
+    "Sensitivity scenario: ",
+    row$scenario,
+    "\nBeta SA = ", row$beta_SA,
+    "\nBeta UG = ", row$beta_UG,
+    "\nBeta ZW = ", row$beta_ZW,
+    "\n============================================\n",
+    sep = ""
+  )
+
+
+  # ---------------------------------------------------------------------------
+  # Generate and fit R_SENS independent populations
+  # ---------------------------------------------------------------------------
+
+  rep_results <- pblapply(
+    seq_len(R_SENS),
+    function(i) {
+
+      # Optional replicate-specific seed
+      set.seed(100000 + i)
+
+      dat <- generate_HAZ_perturbed(
+        N        = N_TARGET,
+        beta_SA  = row$beta_SA,
+        beta_UG  = row$beta_UG,
+        beta_ZW  = row$beta_ZW,
+        sigma_b0 = best_re_params$sigma_b0,
+        sigma_b1 = best_re_params$sigma_b1,
+        rho_b01  = best_re_params$rho_b01
+      )
+
+      fit_gmm_sensitivity(
+        dat = dat,
+        k   = best_k
+      )
+    }
+  )
+
+
+  # ---------------------------------------------------------------------------
+  # Store results
+  # ---------------------------------------------------------------------------
+
+  out <- list(
+    scenario = row$scenario,
+    parameter = row$parameter,
+    results = rep_results
+  )
+
+  cache_save(
+    out,
+    cname
+  )
+
+  return(out)
+}
+````
+
+
+```{r}
+
+# =============================================================================
+# REMOVE OLD/STALE SENSITIVITY CACHES
+# =============================================================================
+#
+# IMPORTANT:
+# The previous analysis stored the failed 0%-convergence results.
+# Delete them before running the corrected grid-search version.
+# =============================================================================
+
+for (nm in perturbation_grid$scenario) {
+
+  old_cache <- paste0(
+    "sim_cache_HAZ/HAZ_sensitivity_",
+    gsub("[^A-Za-z0-9]", "_", nm),
+    "_R",
+    R_SENS,
+    ".rds"
+  )
+
+  if (file.exists(old_cache)) {
+
+    removed <- file.remove(old_cache)
+
+    message(
+      "Removed old cache: ",
+      old_cache,
+      " | success = ",
+      removed
+    )
+
+  } else {
+
+    message(
+      "No existing cache found for: ",
+      nm
+    )
+  }
+}
+```
+
+
+```{r}
+# =============================================================================
+# TEST ONE BASELINE REPLICATE
+# =============================================================================
+
+set.seed(123)
+
+test_dat <- generate_HAZ_perturbed(
+  N        = N_TARGET,
+  beta_SA  = 0.45,
+  beta_UG  = 0.20,
+  beta_ZW  = 0.15,
+  sigma_b0 = best_re_params$sigma_b0,
+  sigma_b1 = best_re_params$sigma_b1,
+  rho_b01  = best_re_params$rho_b01
+)
+
+test_fit <- fit_gmm_sensitivity(
+  dat = test_dat,
+  k   = best_k
+)
+
+str(test_fit)
+
+```
+
+
+```{r}
+
+test_fit$class_props
+test_fit$time_slopes
+test_fit$BIC
+test_fit$loglik
+```
+
+
+```{r}
+
+# =============================================================================
+# RUN 100 REPLICATES × 7 SCENARIOS
+# =============================================================================
+
+sensitivity_raw <- purrr::map(
+  seq_len(nrow(perturbation_grid)),
+  function(i) {
+
+    run_sensitivity_scenario(
+      perturbation_grid[i, ]
+    )
+  }
+)
+
+names(sensitivity_raw) <- perturbation_grid$scenario
+```
+
+
+
+```{r}
+
+# =============================================================================
+# SUMMARISE SENSITIVITY RESULTS
+# =============================================================================
+
+summarise_sensitivity <- function(scn) {
+
+  fits <- Filter(
+    function(f) isTRUE(f$converged),
+    scn$results
+  )
+
+  n_converged <- length(fits)
+  n_total <- length(scn$results)
+
+
+  # ---------------------------------------------------------------------------
+  # No convergence
+  # ---------------------------------------------------------------------------
+
+  if (n_converged == 0) {
+
+    errs <- unique(
+      vapply(
+        scn$results,
+        function(f) {
+
+          if (!is.null(f$error)) {
+            f$error
+          } else {
+            NA_character_
+          }
+        },
+        character(1)
+      )
+    )
+
+    errs <- errs[!is.na(errs)]
+
+    warning(
+      sprintf(
+        "Scenario '%s': 0/%d replicates converged. Errors: %s",
+        scn$scenario,
+        n_total,
+        paste(
+          head(errs, 3),
+          collapse = " | "
+        )
+      )
+    )
+
+
+    empty <- setNames(
+      as.list(
+        rep(
+          NA_real_,
+          3 * best_k
+        )
+      ),
+      c(
+        paste0(
+          "mean_prop_class",
+          1:best_k
+        ),
+        paste0(
+          "mean_slope_class",
+          1:best_k
+        ),
+        paste0(
+          "sd_slope_class",
+          1:best_k
+        )
+      )
+    )
+
+
+    return(
+      tibble(
+        scenario = scn$scenario,
+        n_converged = 0,
+        n_total = n_total,
+        convergence_rate = 0
+      ) %>%
+        bind_cols(
+          as_tibble(empty)
+        )
+    )
+  }
+
+
+  # ---------------------------------------------------------------------------
+  # Class proportions
+  # ---------------------------------------------------------------------------
+
+  props_mat <- do.call(
+    rbind,
+    lapply(
+      fits,
+      function(f) {
+        f$class_props[
+          as.character(1:best_k)
+        ]
+      }
+    )
+  )
+
+
+  # ---------------------------------------------------------------------------
+  # Time slopes
+  # ---------------------------------------------------------------------------
+
+  slopes_mat <- do.call(
+    rbind,
+    lapply(
+      fits,
+      function(f) {
+        f$time_slopes
+      }
+    )
+  )
+
+
+  # ---------------------------------------------------------------------------
+  # Summary
+  # ---------------------------------------------------------------------------
+
+  tibble(
+    scenario = scn$scenario,
+
+    n_converged = n_converged,
+
+    n_total = n_total,
+
+    convergence_rate =
+      n_converged / n_total,
+
+    !!!setNames(
+      as.list(
+        colMeans(
+          props_mat,
+          na.rm = TRUE
+        )
+      ),
+      paste0(
+        "mean_prop_class",
+        1:best_k
+      )
+    ),
+
+    !!!setNames(
+      as.list(
+        colMeans(
+          slopes_mat,
+          na.rm = TRUE
+        )
+      ),
+      paste0(
+        "mean_slope_class",
+        1:best_k
+      )
+    ),
+
+    !!!setNames(
+      as.list(
+        apply(
+          slopes_mat,
+          2,
+          sd,
+          na.rm = TRUE
+        )
+      ),
+      paste0(
+        "sd_slope_class",
+        1:best_k
+      )
+    )
+  )
+}
+
+
+# =============================================================================
+# CREATE FINAL SENSITIVITY TABLE
+# =============================================================================
+
+sensitivity_summary <-
+  purrr::map_dfr(
+    sensitivity_raw,
+    summarise_sensitivity
+  ) %>%
+  left_join(
+    perturbation_grid %>%
+      select(
+        scenario,
+        parameter,
+        beta_SA,
+        beta_UG,
+        beta_ZW
+      ),
+    by = "scenario"
+  )
+
+
+# =============================================================================
+# DISPLAY TABLE
+# =============================================================================
+
+knitr::kable(
+  sensitivity_summary,
+  digits = 3,
+  caption = paste0(
+    "Sensitivity of GMM class proportions and trajectory (time) slopes ",
+    "to country-effect perturbations (K = ",
+    best_k,
+    " classes; R = ",
+    R_SENS,
+    " replicate HUU populations per scenario)"
+  )
+)
+```
+
+
+```{r}
+
+# =============================================================================
+# VISUALISE CLASS-PROPORTION STABILITY
+# =============================================================================
+
+sensitivity_summary %>%
+  select(
+    scenario,
+    parameter,
+    starts_with("mean_prop_class")
+  ) %>%
+  pivot_longer(
+    starts_with("mean_prop_class"),
+    names_to = "class",
+    values_to = "proportion"
+  ) %>%
+  mutate(
+    class = gsub(
+      "mean_prop_class",
+      "Class ",
+      class
+    )
+  ) %>%
+  ggplot(
+    aes(
+      x = scenario,
+      y = proportion,
+      fill = class
+    )
+  ) +
+  geom_col(
+    position = "stack"
+  ) +
+  geom_hline(
+    yintercept = c(
+      0.25,
+      0.50,
+      0.75
+    ),
+    linetype = "dotted",
+    colour = "grey60"
+  ) +
+  coord_flip() +
+  labs(
+    title =
+      "GMM Class-Proportion Stability Under Country-Effect Perturbations",
+
+    subtitle =
+      paste0(
+        "K = ",
+        best_k,
+        " classes; R = ",
+        R_SENS,
+        " replicate HUU populations per scenario (Table 3 grid)"
+      ),
+
+    x = NULL,
+
+    y = "Mean class proportion",
+
+    fill = "Latent class"
+  ) +
+  theme_bw(
+    base_size = 12
+  )
+```
+
+
+
+```{r}
+library(lcmm)
+
+# Extract posterior probabilities
+postprob(best_gmm)  # Summary of classification quality
+
+# Check classification certainty
+posterior <- best_gmm$pprob
+summary(posterior[,c("class", "prob1", "prob2")])
+
+summary(frac_poly_formula)
+
+# Look for entropy (higher = better separation)
+# Entropy close to 1 indicates clear class separation
+
+```
+
+```{r}
+
+# ── Inspect a single scenario/replicate on demand ─────────────────────────────
+# Doesn't touch the cached batch results — just re-runs one fit so you can
+# call summary() on the actual model object.
+inspect_sensitivity_fit <- function(scenario_name, rep_seed = 100001) {
+
+  row <- perturbation_grid %>% filter(scenario == scenario_name)
+  if (nrow(row) == 0) stop("Scenario not found: ", scenario_name)
+
+  set.seed(rep_seed)
+
+  dat <- generate_HAZ_perturbed(
+    N        = N_TARGET,
+    beta_SA  = row$beta_SA,
+    beta_UG  = row$beta_UG,
+    beta_ZW  = row$beta_ZW,
+    sigma_b0 = best_re_params$sigma_b0,
+    sigma_b1 = best_re_params$sigma_b1,
+    rho_b01  = best_re_params$rho_b01
+  )
+
+  gmm_dat <- dat %>%
+    filter(!is.na(outcome)) %>%
+    arrange(child_id, age_mo) %>%
+    mutate(
+      id = as.integer(factor(child_id)),
+      agemos_log = log(age_mo + 1),
+      agemos_inv = 1 / (age_mo + 1)
+    ) %>%
+    select(id, time = age_mo, outcome, agemos_log, agemos_inv, country) %>%
+    as.data.frame()
+
+  m1 <- hlme(
+    fixed   = outcome ~ time + agemos_log + agemos_inv,
+    random  = ~ time,
+    subject = "id",
+    data    = gmm_dat,
+    ng      = 1
+  )
+
+  m <- lcmm::gridsearch(
+    rep = 5, maxiter = 10, minit = m1,
+    hlme(
+      fixed   = outcome ~ time + agemos_log + agemos_inv,
+      mixture = ~ time + agemos_log + agemos_inv,
+      random  = ~ time,
+      classmb = ~ country,
+      ng      = best_k, nwg = TRUE, idiag = FALSE,
+      subject = "id", data = gmm_dat
+    )
+  )
+
+  m   # return the fitted model object
+}
+
+# ── Example usage ──────────────────────────────────────────────────────────
+one_fit <- inspect_sensitivity_fit("Baseline (calibrated)")
+
+cat("\n--- summary() ---\n")
+print(summary(one_fit))
+
+cat("\n--- postprob(): classification quality ---\n")
+print(postprob(one_fit))
+
+cat("\n--- summarytable(): fit indices ---\n")
+print(summarytable(one_fit))
+```
+
+
+
+
+
+```{r}
+# ─────────────────────────────────────────────────────────────
+# Load libraries
+# ─────────────────────────────────────────────────────────────
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+# ─────────────────────────────────────────────────────────────
+# 1. Age sequence
+# ─────────────────────────────────────────────────────────────
+agemos <- seq(0.5, 60, by = 0.5)
+
+# ─────────────────────────────────────────────────────────────
+# 2. Longitudinal model coefficients
+#    4-class HAZ model
+# ─────────────────────────────────────────────────────────────
+
+coef_class1 <- c(
+  intercept  =  3.54455,
+  time       = -0.02246,
+  agemos_log = -1.32028,
+  agemos_inv = -3.43263
+)
+
+coef_class2 <- c(
+  intercept  = -0.12966,
+  time       =  0.00514,
+  agemos_log =  0.18091,
+  agemos_inv = -0.33535
+)
+
+coef_class3 <- c(
+  intercept  = -4.69674,
+  time       = -0.01275,
+  agemos_log =  2.10531,
+  agemos_inv =  3.67236
+)
+
+coef_class4 <- c(
+  intercept  = -0.34184,
+  time       = -0.05947,
+  agemos_log =  0.48162,
+  agemos_inv =  0.22922
+)
+
+# ─────────────────────────────────────────────────────────────
+# 3. Generate predicted trajectories
+# ─────────────────────────────────────────────────────────────
+
+pred_data <- data.frame(agemos = agemos) %>%
+  mutate(
+    time       = agemos,
+    agemos_log = log(agemos + 1),
+    agemos_inv = 1 / (agemos + 1),
+
+    class1 = coef_class1["intercept"] +
+             coef_class1["time"] * time +
+             coef_class1["agemos_log"] * agemos_log +
+             coef_class1["agemos_inv"] * agemos_inv,
+
+    class2 = coef_class2["intercept"] +
+             coef_class2["time"] * time +
+             coef_class2["agemos_log"] * agemos_log +
+             coef_class2["agemos_inv"] * agemos_inv,
+
+    class3 = coef_class3["intercept"] +
+             coef_class3["time"] * time +
+             coef_class3["agemos_log"] * agemos_log +
+             coef_class3["agemos_inv"] * agemos_inv,
+
+    class4 = coef_class4["intercept"] +
+             coef_class4["time"] * time +
+             coef_class4["agemos_log"] * agemos_log +
+             coef_class4["agemos_inv"] * agemos_inv
+  )
+
+# ─────────────────────────────────────────────────────────────
+# 4. Reshape to long format
+# ─────────────────────────────────────────────────────────────
+
+pred_long <- pred_data %>%
+  pivot_longer(
+    cols = c(class1, class2, class3, class4),
+    names_to = "Class",
+    values_to = "HAZ"
+  )
+
+# ─────────────────────────────────────────────────────────────
+# 5. Label classes
+#    Keep neutral labels until trajectory shapes are confirmed
+# ─────────────────────────────────────────────────────────────
+
+pred_long <- pred_long %>%
+  mutate(
+    Class = recode(
+      Class,
+      class1 = "Class 1",
+      class2 = "Class 2",
+      class3 = "Class 3",
+      class4 = "Class 4"
+    )
+  )
+
+# ─────────────────────────────────────────────────────────────
+# 6. Plot trajectories
+# ─────────────────────────────────────────────────────────────
+
+ggplot(
+  pred_long,
+  aes(x = agemos, y = HAZ, color = Class)
+) +
+  geom_line(linewidth = 1.2) +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed"
+  ) +
+  labs(
+    x = "Age (months)",
+    y = "Predicted height-for-age z-score (HAZ)",
+    color = "Growth trajectory"
+  ) +
+  theme_minimal(base_size = 14)
+
+```
+
+
+
+
+
+
 
 
